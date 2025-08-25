@@ -6,7 +6,8 @@ import gc
 import random
 import os
 from kaggle_environments import make, utils
-
+import pygame
+import math
 
 class ConnectFourEnv(gym.Env):
     metadata = {"render_modes": ["human", "ansi"], "render_fps": 20}
@@ -27,8 +28,11 @@ class ConnectFourEnv(gym.Env):
             "board": spaces.Box(low=0, high=2, shape=(self.height * self.width,), dtype=np.float32),
             "mark": spaces.Box(low=1, high=2, shape=(1,), dtype=np.float32)
         })
-        self.opponent_list = [self.load_agent(f) for f in os.listdir(os.path.join('opponent')) if f.endswith('.py')]
-        # self.opponent_list.append('self')
+        self.folder_path = 'opponents'
+        self.opponent_list = [self.load_agent(f) for f in os.listdir(os.path.join(self.folder_path)) if f.endswith('.py')]
+        self.opponent_list.append('self')
+        temp = ", ".join([getattr(opponent, '_source_file', '') for opponent in self.opponent_list])
+        print(temp)
         self.render_mode = render_mode
         self.action_space = spaces.Discrete(self.width)
         self.config = {"rows": self.height, "columns": self.width, "inarow": self.connect}
@@ -50,12 +54,16 @@ class ConnectFourEnv(gym.Env):
         gc.collect()
 
         # 先決定對手
-        self.opponent = np.random.choice(self.opponent_list)
+        if self.episode_count < 500000 and False:
+            self.opponent = 'self'
+        else:
+            self.opponent = np.random.choice(self.opponent_list)
+
         if self.opponent == 'self':
             self._opponent_name_cached = 'self_play'
         elif callable(self.opponent):
             self._opponent_name_cached = getattr(self.opponent, "_source_file",
-                                                 getattr(self.opponent, "__name__", "callable_opponent"))
+                                                 getattr(self.opponent, "_source_file", "callable_opponent"))
         else:
             self._opponent_name_cached = str(self.opponent)
 
@@ -68,7 +76,6 @@ class ConnectFourEnv(gym.Env):
                 self.games_count += 1
                 return obs, {}
         self.games_count += 1
-
         if self.games_count % 200 == 0:
             print(f'win_rate: {(self.win_count / self.games_count):.3f}')
         return self._get_obs(), {}
@@ -90,7 +97,7 @@ class ConnectFourEnv(gym.Env):
         return info
 
     def load_agent(self, file_path):
-        submission = utils.read_file(os.path.join('opponent', file_path))
+        submission = utils.read_file(os.path.join(self.folder_path, file_path))
         agent = utils.get_last_callable(submission)
         setattr(agent, "_source_file", file_path)
         return agent
@@ -110,40 +117,51 @@ class ConnectFourEnv(gym.Env):
             if self.opponent == 'self':
                 # 自對弈：用傳入 action (可能是上一個策略輸出)
                 if not self._is_valid_action(action):
+                    info.update({'evaluation': 0.0})
                     info.update({'game_result': 'win', 'winner': 2})  # 視作我方勝 (對手非法)
-                    return self._get_obs(), 1.0, True, False, info
+                    return self._get_obs(), 0.0, True, False, info
                 row = self._next_open_row(action)
                 self.board[row, action] = self.label
                 # 勝負判斷 (這一步是對手下的，如果對手形成連線 → 我方 loss)
                 if self._is_winner(self.label):
+                    info.update({'evaluation': -30.0})
                     info.update({'game_result': 'loss', 'winner': self.label})
                     return self._get_obs(), -30.0, True, False, info
                 if self._is_draw():
                     info.update({'game_result': 'draw'})
+                    info.update({'evaluation': -0.1})
+
                     return self._get_obs(), -0.1, True, False, info
                 # 換我方
                 self.current_player = 2
                 self.label = 2
-                return self._get_obs(), 0.01, False, False, info
+                info.update({'evaluation': 0.07})
+
+                return self._get_obs(), 0.07, False, False, info
             else:
                 # 外部對手
                 opp_action = self._get_opponent_action()
                 if not self._is_valid_action(opp_action):
+                    info.update({'evaluation': 0.0})
                     info.update({'game_result': 'win', 'winner': 2})
-                    return self._get_obs(), 1.0, True, False, info
+                    return self._get_obs(), 0.0, True, False, info
                 row = self._next_open_row(opp_action)
                 self.board[row, opp_action] = self.label
                 if self._is_winner(self.label):
                     # 對手剛剛贏
+                    info.update({'evaluation': -30.0})
                     info.update({'game_result': 'loss', 'winner': self.label})
                     return self._get_obs(), -30.0, True, False, info
                 if self._is_draw():
+                    info.update({'evaluation': -0.1})
                     info.update({'game_result': 'draw'})
                     return self._get_obs(), -0.1, True, False, info
                 # 換我方
                 self.current_player = 2
                 self.label = 2
-                return self._get_obs(), 0.01, False, False, info
+                info.update({'evaluation': 0.07})
+
+                return self._get_obs(), 0.07, False, False, info
 
         # 我方行動 (current_player == 2)
         if not self._is_valid_action(action):
@@ -157,17 +175,21 @@ class ConnectFourEnv(gym.Env):
 
         if self._is_winner(self.label):
             self.win_count += 1
+            info.update({'evaluation': 2})
             info.update({'game_result': 'win', 'winner': self.label})
             return self._get_obs(), 2.0, True, False, info
         if self._is_draw():
+            info.update({'evaluation': -0.1})
             info.update({'game_result': 'draw'})
             return self._get_obs(), -0.1, True, False, info
 
         # 換對手
         self.current_player = 1
         self.label = 1
+        info.update({'evaluation': 0.07})
+
         # 若自對弈則不自動馬上再呼叫 step(None)，讓外部控制流程；若想自動可遞迴
-        return self._get_obs(), 0.01, False, False, info
+        return self._get_obs(), 0.07, False, False, info
 
     def _is_valid_action(self, action):
         if action is None or not isinstance(action, (int, np.integer)) or action < 0 or action >= self.width:
@@ -262,149 +284,243 @@ class ConnectFourEnv(gym.Env):
             return
         else:
             # Human mode with pygame
-            import pygame
-            
-            if not hasattr(self, 'pygame_initialized'):
-                pygame.init()
-                self.pygame_initialized = True
-                
-                # 顏色定義
-                self.COLORS = {
-                    'background': (240, 248, 255),  # AliceBlue
-                    'board': (65, 105, 225),        # RoyalBlue
-                    'board_shadow': (25, 25, 112),  # MidnightBlue
-                    'player1': (220, 20, 60),       # Crimson (submission_vMega)
-                    'player2': (255, 215, 0),       # Gold (RL Agent)
-                    'empty': (255, 255, 255),       # White
-                    'text': (25, 25, 112),          # MidnightBlue
-                    'highlight': (50, 205, 50),     # LimeGreen
-                    'border': (105, 105, 105)       # DimGray
-                }
-                
-                # 尺寸設定
-                self.CELL_SIZE = 80
-                self.MARGIN = 12
-                self.TOP_MARGIN = 140
-                self.BOTTOM_MARGIN = 60
-                
-                self.screen_width = self.width * self.CELL_SIZE + (self.width + 1) * self.MARGIN
-                self.screen_height = (self.height * self.CELL_SIZE + 
-                                    (self.height + 1) * self.MARGIN + 
-                                    self.TOP_MARGIN + self.BOTTOM_MARGIN)
-                
-                self.screen = pygame.display.set_mode((self.screen_width, self.screen_height))
-                pygame.display.set_caption("🔴🟡 Connect Four - AI Training")
-                self.clock = pygame.time.Clock()
-                
-                # 字體
-                self.font_large = pygame.font.Font(None, 36)
-                self.font_medium = pygame.font.Font(None, 28)
+            renderer = ConnectFourRenderer()
+            renderer.render(self.board, self.current_player, self.win_count, self.games_count)
+
+class ConnectFourRenderer:
+    def __init__(self, width=7, height=6):
+        self.width = width
+        self.height = height
+        self.pygame_initialized = False
+        self.animations = []  # Store animation states
+        self.particles = []   # Store particle effects
+
+    def initialize_pygame(self):
+        if not self.pygame_initialized:
+            pygame.init()
+            self.pygame_initialized = True
+
+            # Colors with modern palette
+            self.COLORS = {
+                'background_start': (10, 10, 30),  # Dark space blue
+                'background_end': (50, 50, 100),   # Lighter blue for gradient
+                'board': (20, 20, 60, 200),       # Semi-transparent dark blue
+                'board_shadow': (0, 0, 0, 100),    # Subtle shadow
+                'player1': (255, 80, 80),          # Neon red
+                'player2': (80, 255, 255),         # Neon cyan
+                'empty': (255, 255, 255, 50),      # Transparent white
+                'text': (200, 200, 255),           # Light blue text
+                'highlight': (100, 255, 100, 150), # Glowing green
+                'border': (50, 50, 80),            # Dark border
+                'glow': (255, 255, 255, 80)        # Glow effect
+            }
+
+            # Dimensions
+            self.CELL_SIZE = 80
+            self.MARGIN = 12
+            self.TOP_MARGIN = 160
+            self.BOTTOM_MARGIN = 80
+
+            self.screen_width = self.width * self.CELL_SIZE + (self.width + 1) * self.MARGIN
+            self.screen_height = (self.height * self.CELL_SIZE + 
+                                (self.height + 1) * self.MARGIN + 
+                                self.TOP_MARGIN + self.BOTTOM_MARGIN)
+
+            self.screen = pygame.display.set_mode((self.screen_width, self.screen_height))
+            pygame.display.set_caption("🔴🟡 Connect Four - Cyber Edition")
+            self.clock = pygame.time.Clock()
+
+            # Fonts (use a modern system font or fallback)
+            try:
+                self.font_large = pygame.font.SysFont('consolas', 40, bold=True)
+                self.font_medium = pygame.font.SysFont('consolas', 30)
+                self.font_small = pygame.font.SysFont('consolas', 24)
+            except:
+                self.font_large = pygame.font.Font(None, 40)
+                self.font_medium = pygame.font.Font(None, 30)
                 self.font_small = pygame.font.Font(None, 24)
 
-            # 處理pygame事件
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    pygame.quit()
-                    sys.exit()
+    def add_piece_animation(self, row, col, player):
+        """Add a falling animation for a piece"""
+        start_y = self.TOP_MARGIN - self.CELL_SIZE
+        end_y = self.TOP_MARGIN + row * (self.CELL_SIZE + self.MARGIN) + self.MARGIN // 2 + self.CELL_SIZE // 2
+        self.animations.append({
+            'row': row,
+            'col': col,
+            'player': player,
+            'y': start_y,
+            'end_y': end_y,
+            'speed': 20,  # Pixels per frame
+            't': 0  # For easing
+        })
 
-            # 清空螢幕
-            self.screen.fill(self.COLORS['background'])
-            
-            # 繪製標題
-            title_text = self.font_large.render("Connect Four", True, self.COLORS['text'])
-            title_rect = title_text.get_rect(center=(self.screen_width // 2, 25))
-            self.screen.blit(title_text, title_rect)
-            
-            # 繪製玩家資訊
-            player1_text = "🔴 Player 1: submission_vMega"
-            player2_text = "🟡 Player 2: RL Agent"
+    def update_animations(self):
+        """Update all active animations"""
+        for anim in self.animations[:]:
+            anim['t'] += 0.05  # Animation progress
+            if anim['t'] >= 1:
+                anim['y'] = anim['end_y']
+                self.animations.remove(anim)
+            else:
+                # Ease-out quadratic
+                eased_t = 1 - (1 - anim['t']) ** 2
+                anim['y'] = anim['y'] + (anim['end_y'] - anim['y']) * eased_t
 
-            p1_surface = self.font_medium.render(player1_text, True, self.COLORS['player1'])
-            p2_surface = self.font_medium.render(player2_text, True, self.COLORS['player2'])
-            
-            self.screen.blit(p1_surface, (20, 55))
-            self.screen.blit(p2_surface, (20, 80))
-            
-            # 顯示當前回合
-            current_player_name = "submission_vMega" if self.current_player == 1 else "RL Agent"
-            turn_text = f"🎯 Turn: {current_player_name}"
-            turn_color = self.COLORS['player1'] if self.current_player == 1 else self.COLORS['player2']
-            
-            turn_surface = self.font_medium.render(turn_text, True, turn_color)
-            self.screen.blit(turn_surface, (20, 105))
-            
-            # 顯示勝率
-            win_rate = self.win_count / self.games_count if self.games_count > 0 else 0
-            stats_text = f"📊 Games: {self.games_count} | RL Agent Wins: {self.win_count} | Win Rate: {win_rate:.3f}"
-            stats_surface = self.font_small.render(stats_text, True, self.COLORS['text'])
-            stats_rect = stats_surface.get_rect(center=(self.screen_width // 2, self.TOP_MARGIN - 15))
-            self.screen.blit(stats_surface, stats_rect)
-            
-            # 繪製棋盤背景（帶陰影效果）
-            board_start_x = self.MARGIN
-            board_start_y = self.TOP_MARGIN
-            board_width = self.width * self.CELL_SIZE + (self.width - 1) * self.MARGIN
-            board_height = self.height * self.CELL_SIZE + (self.height - 1) * self.MARGIN
-            
-            # 陰影
-            shadow_offset = 4
-            shadow_rect = pygame.Rect(
-                board_start_x + shadow_offset, 
-                board_start_y + shadow_offset, 
-                board_width + self.MARGIN, 
-                board_height + self.MARGIN
-            )
-            pygame.draw.rect(self.screen, self.COLORS['board_shadow'], shadow_rect, border_radius=12)
-            
-            # 主棋盤
-            board_rect = pygame.Rect(board_start_x, board_start_y, board_width + self.MARGIN, board_height + self.MARGIN)
-            pygame.draw.rect(self.screen, self.COLORS['board'], board_rect, border_radius=12)
-            
-            # 繪製棋子
-            for r in range(self.height):
-                for c in range(self.width):
-                    # 計算位置
-                    x = board_start_x + c * (self.CELL_SIZE + self.MARGIN) + self.MARGIN // 2
-                    y = board_start_y + r * (self.CELL_SIZE + self.MARGIN) + self.MARGIN // 2
-                    center_x = x + self.CELL_SIZE // 2
-                    center_y = y + self.CELL_SIZE // 2
-                    radius = self.CELL_SIZE // 2 - 8
-                    
-                    # 根據棋盤狀態選擇顏色
-                    cell_value = self.board[r, c]
-                    if cell_value == 1:
-                        color = self.COLORS['player1']  # submission_vMega
-                    elif cell_value == 2:
-                        color = self.COLORS['player2']  # RL Agent
-                    else:
-                        color = self.COLORS['empty']
-                    
-                    # 繪製棋子陰影
-                    if cell_value != 0:
-                        shadow_center = (center_x + 2, center_y + 2)
-                        pygame.draw.circle(self.screen, self.COLORS['board_shadow'], shadow_center, radius - 2)
-                    
-                    # 繪製棋子
-                    pygame.draw.circle(self.screen, color, (center_x, center_y), radius)
-                    
-                    # 繪製棋子邊框
-                    border_color = self.COLORS['border'] if cell_value == 0 else self.COLORS['board_shadow']
-                    border_width = 2 if cell_value == 0 else 3
-                    pygame.draw.circle(self.screen, border_color, (center_x, center_y), radius, border_width)
-                    
-                    # 為空格子添加光澤效果
-                    if cell_value == 0:
-                        highlight_radius = radius // 3
-                        highlight_center = (center_x - radius // 3, center_y - radius // 3)
-                        pygame.draw.circle(self.screen, (255, 255, 255, 100), highlight_center, highlight_radius)
-            
-            # 繪製列號
+    def add_particle(self, x, y, color):
+        """Add particle effect at position"""
+        for _ in range(5):
+            self.particles.append({
+                'x': x,
+                'y': y,
+                'vx': random.uniform(-2, 2),
+                'vy': random.uniform(-2, 2),
+                'life': 20,
+                'color': color
+            })
+
+    def update_particles(self):
+        """Update particle effects"""
+        for particle in self.particles[:]:
+            particle['x'] += particle['vx']
+            particle['y'] += particle['vy']
+            particle['life'] -= 1
+            if particle['life'] <= 0:
+                self.particles.remove(particle)
+
+    def render(self, board, current_player, win_count, games_count):
+        self.initialize_pygame()
+        self.board = board
+        self.current_player = current_player
+        self.win_count = win_count
+        self.games_count = games_count
+
+        # Handle events
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                pygame.quit()
+                sys.exit()
+
+        # Update animations and particles
+        self.update_animations()
+        self.update_particles()
+
+        # Draw gradient background
+        for y in range(self.screen_height):
+            t = y / self.screen_height
+            r = int(self.COLORS['background_start'][0] + t * (self.COLORS['background_end'][0] - self.COLORS['background_start'][0]))
+            g = int(self.COLORS['background_start'][1] + t * (self.COLORS['background_end'][1] - self.COLORS['background_start'][1]))
+            b = int(self.COLORS['background_start'][2] + t * (self.COLORS['background_end'][2] - self.COLORS['background_start'][2]))
+            pygame.draw.line(self.screen, (r, g, b), (0, y), (self.screen_width, y))
+
+        # Draw title with glow
+        title_text = self.font_large.render("Connect Four", True, self.COLORS['text'])
+        title_rect = title_text.get_rect(center=(self.screen_width // 2, 30))
+        for offset in range(1, 4):
+            glow_text = self.font_large.render("Connect Four", True, self.COLORS['glow'])
+            self.screen.blit(glow_text, title_rect.move(offset, offset))
+            self.screen.blit(glow_text, title_rect.move(-offset, -offset))
+        self.screen.blit(title_text, title_rect)
+
+        # Draw player info with icons
+        player1_text = "🔴 Player 1: CyberBot"
+        player2_text = "🟡 Player 2: AI Agent"
+        p1_surface = self.font_medium.render(player1_text, True, self.COLORS['player1'])
+        p2_surface = self.font_medium.render(player2_text, True, self.COLORS['player2'])
+        self.screen.blit(p1_surface, (20, 60))
+        self.screen.blit(p2_surface, (20, 90))
+
+        # Draw current turn with glow
+        current_player_name = "CyberBot" if self.current_player == 1 else "AI Agent"
+        turn_text = f"🎯 Turn: {current_player_name}"
+        turn_color = self.COLORS['player1'] if self.current_player == 1 else self.COLORS['player2']
+        turn_surface = self.font_medium.render(turn_text, True, turn_color)
+        turn_rect = turn_surface.get_rect(topleft=(20, 120))
+        for offset in range(1, 3):
+            glow_surface = self.font_medium.render(turn_text, True, self.COLORS['glow'])
+            self.screen.blit(glow_surface, turn_rect.move(offset, offset))
+        self.screen.blit(turn_surface, turn_rect)
+
+        # Draw stats
+        win_rate = self.win_count / self.games_count if self.games_count > 0 else 0
+        stats_text = f"📊 Games: {self.games_count} | AI Wins: {self.win_count} | Win Rate: {win_rate:.3f}"
+        stats_surface = self.font_small.render(stats_text, True, self.COLORS['text'])
+        stats_rect = stats_surface.get_rect(center=(self.screen_width // 2, self.TOP_MARGIN - 20))
+        self.screen.blit(stats_surface, stats_rect)
+
+        # Draw board with shadow
+        board_start_x = self.MARGIN
+        board_start_y = self.TOP_MARGIN
+        board_width = self.width * self.CELL_SIZE + (self.width - 1) * self.MARGIN
+        board_height = self.height * self.CELL_SIZE + (self.height - 1) * self.MARGIN
+
+        # Board shadow
+        shadow_rect = pygame.Rect(
+            board_start_x + 6, board_start_y + 6, 
+            board_width + self.MARGIN, board_height + self.MARGIN
+        )
+        pygame.draw.rect(self.screen, self.COLORS['board_shadow'], shadow_rect, border_radius=15)
+
+        # Main board
+        board_rect = pygame.Rect(board_start_x, board_start_y, 
+                               board_width + self.MARGIN, board_height + self.MARGIN)
+        pygame.draw.rect(self.screen, self.COLORS['board'], board_rect, border_radius=15)
+
+        # Draw pieces
+        for r in range(self.height):
             for c in range(self.width):
-                col_x = board_start_x + c * (self.CELL_SIZE + self.MARGIN) + self.CELL_SIZE // 2
-                col_text = self.font_small.render(str(c), True, self.COLORS['text'])
-                col_rect = col_text.get_rect(center=(col_x, self.screen_height - 30))
-                self.screen.blit(col_text, col_rect)
-            
-            # 更新顯示
-            pygame.display.flip()
-            self.clock.tick(60)  # 60 FPS
+                x = board_start_x + c * (self.CELL_SIZE + self.MARGIN) + self.MARGIN // 2
+                y = board_start_y + r * (self.CELL_SIZE + self.MARGIN) + self.MARGIN // 2
+                center_x = x + self.CELL_SIZE // 2
+                center_y = y + self.CELL_SIZE // 2
+                radius = self.CELL_SIZE // 2 - 8
+
+                cell_value = self.board[r, c]
+                color = (self.COLORS['player1'] if cell_value == 1 else 
+                        self.COLORS['player2'] if cell_value == 2 else 
+                        self.COLORS['empty'])
+
+                # Draw piece shadow
+                if cell_value != 0:
+                    shadow_center = (center_x + 3, center_y + 3)
+                    pygame.draw.circle(self.screen, self.COLORS['board_shadow'], shadow_center, radius - 2)
+
+                # Draw piece with glow
+                if cell_value != 0:
+                    for offset in range(1, 4):
+                        pygame.draw.circle(self.screen, self.COLORS['glow'], (center_x, center_y), radius + offset, 1)
+                pygame.draw.circle(self.screen, color, (center_x, center_y), radius)
+
+                # Draw empty cell highlight
+                if cell_value == 0:
+                    highlight_radius = radius // 2
+                    highlight_center = (center_x - radius // 3, center_y - radius // 3)
+                    pygame.draw.circle(self.screen, self.COLORS['highlight'], highlight_center, highlight_radius)
+
+        # Draw animated pieces
+        for anim in self.animations:
+            center_x = (board_start_x + anim['col'] * (self.CELL_SIZE + self.MARGIN) + 
+                       self.MARGIN // 2 + self.CELL_SIZE // 2)
+            center_y = anim['y']
+            radius = self.CELL_SIZE // 2 - 8
+            color = self.COLORS['player1'] if anim['player'] == 1 else self.COLORS['player2']
+
+            # Glow effect
+            for offset in range(1, 4):
+                pygame.draw.circle(self.screen, self.COLORS['glow'], (center_x, center_y), radius + offset, 1)
+            pygame.draw.circle(self.screen, color, (center_x, center_y), radius)
+            self.add_particle(center_x, center_y, color)
+
+        # Draw particles
+        for particle in self.particles:
+            pygame.draw.circle(self.screen, particle['color'], 
+                             (int(particle['x']), int(particle['y'])), 3)
+
+        # Draw column numbers
+        for c in range(self.width):
+            col_x = board_start_x + c * (self.CELL_SIZE + self.MARGIN) + self.CELL_SIZE // 2
+            col_text = self.font_small.render(str(c), True, self.COLORS['text'])
+            col_rect = col_text.get_rect(center=(col_x, self.screen_height - 40))
+            self.screen.blit(col_text, col_rect)
+
+        pygame.display.flip()
+        self.clock.tick(60)

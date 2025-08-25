@@ -5,6 +5,7 @@ files = os.listdir()
 score_list = []
 for f in files:
     if f.startswith("ppo_connect"):
+        
         # Extract reward value from filename
         match = re.search(r'reward_([-\d.]+)\.zip$', f)
         if match:
@@ -19,5 +20,5 @@ if score_list:
     # Remove all other files
     for reward, filename in score_list:
         if filename != best_file:
-            os.remove(filename)
+            # os.remove(filename)
             print(f"Removed: {filename}")

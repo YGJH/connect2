@@ -133,6 +133,29 @@ class EvaluationCallback(BaseCallback):
             self.last_eval_step = self.num_timesteps
         return True
 
+
+
+    def visualize_model(model, num_episodes=5):
+        """使用單個環境進行可視化"""
+        env = gym.make('ConnectFour-v0', render_mode='human')
+
+        for ep in range(num_episodes):
+            obs, _ = env.reset()
+            terminated = False
+            truncated = False
+            total_reward = 0.0
+            steps = 0
+            print(f"Visualization Episode {ep+1}")
+            while not (terminated or truncated):
+                action, _ = model.predict(obs, deterministic=True)
+                obs, reward, terminated, truncated, info = env.step(action)
+                total_reward += reward
+                steps += 1
+                env.render()
+                time.sleep(0.5)
+            print(f"Episode {ep+1} reward={total_reward} steps={steps}")
+        env.close()
+
     def _evaluate_and_log(self):
         if len(self.rewards) < 100:
             return
@@ -167,9 +190,6 @@ class EvaluationCallback(BaseCallback):
 ⏱ 進度:
   - 總共執行的遊戲: {self.episode_count}
   - 平均長度 (last 100): {avg_episode_length:.1f}
-
-🤖 對手:
-
 """
 
         for opponent, stats in self.opponent_stats.items():
@@ -178,6 +198,8 @@ class EvaluationCallback(BaseCallback):
                 log_info += f"\n  - {opponent}: {opp_wr:.3f} ({stats['wins']}/{stats['games']})"
 
         print(log_info)
+        if total_games % 1000 == 0:
+            visualize_model(self.model, num_episodes=1)
 
         if mean_reward > self.best_mean_reward:
             self.best_mean_reward = mean_reward
@@ -186,10 +208,11 @@ class EvaluationCallback(BaseCallback):
             send_telegram(f"新最佳模型\nMean(step1000)={mean_reward:.3f} WinRate={win_rate:.3f}")
             print(f"[Saved] {model_name}")
 
-        if self.num_timesteps % self.save_freq == 0:
-            ckpt = f"ppo_connectfour_checkpoint_{self.num_timesteps}.zip"
-            self.model.save(ckpt)
-            print(f"[Checkpoint] {ckpt}")
+
+        # if self.num_timesteps % self.save_freq == 0:
+        #     ckpt = f"ppo_connectfour_checkpoint_{self.num_timesteps}.zip"
+        #     self.model.save(ckpt)
+        #     print(f"[Checkpoint] {ckpt}")
 
     def _on_training_end(self):
         self._evaluate_and_log()
@@ -249,7 +272,7 @@ def main():
     register(id='ConnectFour-v0', entry_point='connectFour:ConnectFourEnv')
     
     # 設置參數
-    num_cpu = 5
+    num_cpu = 1
     total_timesteps = 3_000_000
     print(f"使用 {num_cpu} 個並行環境進行訓練")
     
@@ -264,7 +287,7 @@ def main():
         DictTransformerPolicy,
         env,
         verbose=1,
-        n_steps=2048 // num_cpu,
+        n_steps=100 // num_cpu,
         batch_size=256,
         n_epochs=10,
         learning_rate=3e-4,
