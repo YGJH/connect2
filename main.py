@@ -155,20 +155,22 @@ class EvaluationCallback(BaseCallback):
         log_info = f"""
 === 訓練統計 (Step: {self.num_timesteps}) ===
 📊 Reward:
-  - Mean (last 1000 steps): {mean_reward:.3f} ± {std_reward:.3f}
-  - Best step mean: {self.best_mean_reward:.3f}
-  - Mean episode reward (last 100 eps): {avg_episode_reward:.3f}
+  - 平均 reward (last 1000 steps): {mean_reward:.3f} ± {std_reward:.3f}
+  - 最佳平均 reward: {self.best_mean_reward:.3f}
+  - 平均 episode reward (last 100 eps): {avg_episode_reward:.3f}
 
-🎮 Results:
-  - Total finished games: {total_games}
-  - Win: {self.game_results['win']}  Draw: {self.game_results['draw']}  Loss: {self.game_results['loss']}
-  - Win Rate: {win_rate:.3f}  Draw Rate: {draw_rate:.3f}  Loss Rate: {loss_rate:.3f}
+🎮 結果:
+  - 總共執行的遊戲: {total_games}
+  - 勝利: {self.game_results['win']}  Draw: {self.game_results['draw']}  Loss: {self.game_results['loss']}
+  - 勝率: {win_rate:.3f}  Draw Rate: {draw_rate:.3f}  Loss Rate: {loss_rate:.3f}
 
-⏱ Episodes:
-  - Finished episodes: {self.episode_count}
-  - Avg length (last 100): {avg_episode_length:.1f}
+⏱ 進度:
+  - 總共執行的遊戲: {self.episode_count}
+  - 平均長度 (last 100): {avg_episode_length:.1f}
 
-🤖 Opponents:"""
+🤖 對手:
+
+"""
 
         for opponent, stats in self.opponent_stats.items():
             if stats['games'] > 0:
@@ -249,7 +251,6 @@ def main():
     # 設置參數
     num_cpu = 5
     total_timesteps = 3_000_000
-
     print(f"使用 {num_cpu} 個並行環境進行訓練")
     
     # 創建多進程向量化環境
@@ -291,7 +292,7 @@ def main():
     env.close()
     
     print("開始可視化測試...")
-    visualize_model(model, num_episodes=3)
+    visualize_model(model, num_episodes=10)
 
 if __name__ == '__main__':
     main()

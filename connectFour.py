@@ -19,59 +19,64 @@ class ConnectFourEnv(gym.Env):
         self.height = height
         self.connect = connect
         self.episode_count = 0
-        self.board = np.zeros((self.height, self.width), dtype=np.float32)  # 0=empty, 1=first, 2=second
-        self.current_player = 1  # 當前輪到誰 (1 或 2)
+        self.board = np.zeros((self.height, self.width), dtype=np.float32)
+        self.current_player = 1
         self.last_info = None
         self.label = 1
         self.observation_space = spaces.Dict({
             "board": spaces.Box(low=0, high=2, shape=(self.height * self.width,), dtype=np.float32),
             "mark": spaces.Box(low=1, high=2, shape=(1,), dtype=np.float32)
         })
-
         self.opponent_list = [self.load_agent(f) for f in os.listdir(os.path.join('opponent')) if f.endswith('.py')]
-        self.opponent_list.append('self')
+        # self.opponent_list.append('self')
         self.render_mode = render_mode
         self.action_space = spaces.Discrete(self.width)
-        
-        # submission_vMega 的配置
         self.config = {"rows": self.height, "columns": self.width, "inarow": self.connect}
 
     def _get_obs(self, b=None):
-        # 回傳給 RL agent 的觀察：以 RL agent 為視角，mark 永遠是 1
         return {
             "board": self.board.flatten(),
-            "mark": np.array([self.label] , dtype=np.float32)
+            "mark": np.array([self.label], dtype=np.float32)
         }
 
+    def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        self.board.fill(0)    def reset(self, seed=None, options=None):
-
+        self.board.fill(0)
         self.episode_count += 1
         self.label = 1
-        self.current_player = self.games_count % 2
-        self.step_count = 0  # 添加步數計數器
+        # 確保是 1 或 2
+        self.current_player = (self.games_count % 2) + 1
+        self.step_count = 0
         gc.collect()
 
-        if self.current_player == 1:
-            self.step(None)
-        
-        self.games_count += 1
+        # 先決定對手
         self.opponent = np.random.choice(self.opponent_list)
-        
+        if self.opponent == 'self':
+            self._opponent_name_cached = 'self_play'
+        elif callable(self.opponent):
+            self._opponent_name_cached = getattr(self.opponent, "_source_file",
+                                                 getattr(self.opponent, "__name__", "callable_opponent"))
+        else:
+            self._opponent_name_cached = str(self.opponent)
+
+        # 如果對手先手 (設定為 current_player == 1 視作對手)
+        if self.current_player == 1:
+            # 讓對手落子
+            obs, reward, terminated, truncated, info = self.step(None)
+            if terminated or truncated:
+                # 立即結束 (極少見，但保險)
+                self.games_count += 1
+                return obs, {}
+        self.games_count += 1
+
         if self.games_count % 200 == 0:
             print(f'win_rate: {(self.win_count / self.games_count):.3f}')
         return self._get_obs(), {}
 
-
     def _get_info(self):
-        if callable(getattr(self, 'opponent', None)):
-            opp_name = getattr(self.opponent, "_source_file",
-                               getattr(self.opponent, "__name__", "callable_opponent"))
-        else:
-            opp_name = str(getattr(self, 'opponent', 'unknown'))
-
+        # 不在這裡判斷勝負 (避免視角混亂)
         info = {
-            'game_result': None,
+            'game_result': 'ongoing',
             'winner': None,
             'episode_length': getattr(self, 'step_count', 0),
             'total_games': self.games_count,
@@ -79,33 +84,16 @@ class ConnectFourEnv(gym.Env):
             'win_rate': self.win_count / max(self.games_count, 1),
             'current_player': self.current_player,
             'board_filled_ratio': np.count_nonzero(self.board) / (self.height * self.width),
-            'opponent_type': opp_name,
-            'evaluation': 0
+            'opponent_type': getattr(self, '_opponent_name_cached', 'unknown'),
+            'evaluation': 0.0
         }
-        if self._is_winner(self.label):
-            info['game_result'] = 'win'
-            info['winner'] = self.label
-            info['evaluation'] = 2
-        elif self._is_winner(3 - self.label):
-            info['game_result'] = 'loss'
-            info['winner'] = 3 - self.label
-            info['evaluation'] = -30
-        elif self._is_draw():
-            info['game_result'] = 'draw'
-            info['evaluation'] = -0.1
-        else:
-            info['game_result'] = 'ongoing'
-            info['evaluation'] = 0.7
         return info
-
 
     def load_agent(self, file_path):
         submission = utils.read_file(os.path.join('opponent', file_path))
         agent = utils.get_last_callable(submission)
-        # 標記來源檔名，方便統計
         setattr(agent, "_source_file", file_path)
         return agent
-
 
     def _get_opponent_action(self):
         temp = self._get_obs()
@@ -114,69 +102,75 @@ class ConnectFourEnv(gym.Env):
         return self.opponent(temp, self.config)
 
     def step(self, action):
-        self.step_count = getattr(self, 'step_count', 0) + 1  # 增加步數計數
+        self.step_count = getattr(self, 'step_count', 0) + 1
 
-        if self.current_player == 1 or action == None: # if 1 then opponent
-            if self.opponent == 'self':
-                if not self._is_valid_action(action):
-                    return self._get_obs(), 1, True, False, {'evaluation': 1} # submission輸出不合法 對手勝利
-                
-                row = self._next_open_row(action)
-                self.board[row , action] = self.label
-                info = self._get_info()
-                if self._is_winner(self.label):
-                    return self._get_obs(), -30, True, False, info   # submission贏了 給-1
-
-                if self._is_draw():
-                    return self._get_obs(), -0.1, True, False, info # submission平手 給一點點小懲罰
-
-                self.current_player = 3 - self.current_player
-                self.label = 3 - self.label
-                return self._get_obs(), 0.01 , False , False, info  # 多活一點 給一點獎勵 
-
-            else:
-                action = self._get_opponent_action()
-                if not self._is_valid_action(action):
-                    return self._get_obs(), 1, True, False, {'evaluation': 1} # submission輸出不合法 對手勝利
-                
-                row = self._next_open_row(action)
-                self.board[row , action] = self.label
-                info = self._get_info()
-                if self._is_winner(self.label):
-                    info['evaluation'] = -info['evaluation']
-                    return self._get_obs(), -30, True, False, info   # submission贏了 給-1
-
-                if self._is_draw():
-                    return self._get_obs(), -0.1, True, False, info # submission平手 給一點點小懲罰
-
-                self.current_player = 3 - self.current_player
-                self.label = 3 - self.label
-                return self._get_obs(), 0.01 , False , False, info  # 多活一點 給一點獎勵 
-        else:
-            if not self._is_valid_action(action):
-                return self._get_obs(), -10000, True, False, {} # 輸出不合法動作 給超大懲罰
-            row = self._next_open_row(action)
-            self.board[row, action] = self.label
-
+        # 對手行動 (current_player == 1)
+        if self.current_player == 1 or action is None:
             info = self._get_info()
-            if self._is_winner(self.label):
-                self.win_count+=1
-                return self._get_obs(), 2, True, False, info   # 如果贏了給reward
-
-            if self._is_draw():
-                return self._get_obs(), -0.1, True, False, info  # 如果平手 給一點點小懲罰
-
-            self.current_player = 3 - self.current_player
-            self.label = 3 - self.label
             if self.opponent == 'self':
-                return self._get_obs(), 0.01, False, False, info  # 多活一點 給一點獎勵
-            ret , reward , terminated , truncated , info = self.step(None)    # 直接讓對手下棋
-            return ret , reward , terminated, truncated , info
+                # 自對弈：用傳入 action (可能是上一個策略輸出)
+                if not self._is_valid_action(action):
+                    info.update({'game_result': 'win', 'winner': 2})  # 視作我方勝 (對手非法)
+                    return self._get_obs(), 1.0, True, False, info
+                row = self._next_open_row(action)
+                self.board[row, action] = self.label
+                # 勝負判斷 (這一步是對手下的，如果對手形成連線 → 我方 loss)
+                if self._is_winner(self.label):
+                    info.update({'game_result': 'loss', 'winner': self.label})
+                    return self._get_obs(), -30.0, True, False, info
+                if self._is_draw():
+                    info.update({'game_result': 'draw'})
+                    return self._get_obs(), -0.1, True, False, info
+                # 換我方
+                self.current_player = 2
+                self.label = 2
+                return self._get_obs(), 0.01, False, False, info
+            else:
+                # 外部對手
+                opp_action = self._get_opponent_action()
+                if not self._is_valid_action(opp_action):
+                    info.update({'game_result': 'win', 'winner': 2})
+                    return self._get_obs(), 1.0, True, False, info
+                row = self._next_open_row(opp_action)
+                self.board[row, opp_action] = self.label
+                if self._is_winner(self.label):
+                    # 對手剛剛贏
+                    info.update({'game_result': 'loss', 'winner': self.label})
+                    return self._get_obs(), -30.0, True, False, info
+                if self._is_draw():
+                    info.update({'game_result': 'draw'})
+                    return self._get_obs(), -0.1, True, False, info
+                # 換我方
+                self.current_player = 2
+                self.label = 2
+                return self._get_obs(), 0.01, False, False, info
 
+        # 我方行動 (current_player == 2)
+        if not self._is_valid_action(action):
+            info = self._get_info()
+            info.update({'game_result': 'loss', 'winner': 1})
+            return self._get_obs(), -10000.0, True, False, info
 
+        row = self._next_open_row(action)
+        self.board[row, action] = self.label  # self.label 應為 2
+        info = self._get_info()
+
+        if self._is_winner(self.label):
+            self.win_count += 1
+            info.update({'game_result': 'win', 'winner': self.label})
+            return self._get_obs(), 2.0, True, False, info
+        if self._is_draw():
+            info.update({'game_result': 'draw'})
+            return self._get_obs(), -0.1, True, False, info
+
+        # 換對手
+        self.current_player = 1
+        self.label = 1
+        # 若自對弈則不自動馬上再呼叫 step(None)，讓外部控制流程；若想自動可遞迴
+        return self._get_obs(), 0.01, False, False, info
 
     def _is_valid_action(self, action):
-        if action is None or action < 0 or action >= self.width:
+        if action is None or not isinstance(action, (int, np.integer)) or action < 0 or action >= self.width:
             return False
         return self.board[0, action] == 0
 
@@ -189,22 +183,18 @@ class ConnectFourEnv(gym.Env):
     def _is_winner(self, player):
         b = self.board
         H, W, C = self.height, self.width, self.connect
-        # 水平
         for r in range(H):
             for c in range(W - C + 1):
                 if np.all(b[r, c:c+C] == player):
                     return True
-        # 垂直
         for c in range(W):
             for r in range(H - C + 1):
                 if np.all(b[r:r+C, c] == player):
                     return True
-        # 斜線 ↘
         for r in range(H - C + 1):
             for c in range(W - C + 1):
                 if all(b[r+i, c+i] == player for i in range(C)):
                     return True
-        # 斜線 ↗
         for r in range(H - C + 1):
             for c in range(C - 1, W):
                 if all(b[r+i, c-i] == player for i in range(C)):
