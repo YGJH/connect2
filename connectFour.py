@@ -54,10 +54,10 @@ class ConnectFourEnv(gym.Env):
         gc.collect()
 
         # 先決定對手
-        if self.episode_count < 500000 and False:
-            self.opponent = 'self'
-        else:
-            self.opponent = np.random.choice(self.opponent_list)
+        # if self.episode_count < 500000 and False:
+        #     self.opponent = 'self'
+        # else:
+        self.opponent = np.random.choice(self.opponent_list)
 
         if self.opponent == 'self':
             self._opponent_name_cached = 'self_play'

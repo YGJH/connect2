@@ -7,7 +7,7 @@ for f in files:
     if f.startswith("ppo_connect"):
         
         # Extract reward value from filename
-        match = re.search(r'reward_([-\d.]+)\.zip$', f)
+        match = re.search(r'best_([-\d.]+)\.zip$', f)
         if match:
             reward = float(match.group(1))
             score_list.append((reward, f))
