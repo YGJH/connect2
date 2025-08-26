@@ -46,9 +46,70 @@ class DictTransformerPolicy(ActorCriticPolicy):
             action_space,
             lr_schedule,
             features_extractor_class=DictTransformerExtractor,
-            features_extractor_kwargs=dict(features_dim=128, d_model=64, num_layers=14, num_heads=16),
+            features_extractor_kwargs=dict(features_dim=128, d_model=16*24, num_layers=14, num_heads=16),
             **kwargs
         )
+
+    def forward(self, obs, deterministic: bool = False):
+        """
+        obs: dict of tensors (已由 SB3 處理成 torch.Tensor)
+        回傳: actions, values, log_prob (與 ActorCriticPolicy 約定一致)
+        """
+        # 取得 latent
+        features = self.extract_features(obs)
+        latent_pi, latent_vf, latent_sde = self._get_latent(features)
+        distribution = self._get_action_dist_from_latent(latent_pi)
+
+        # 取得 action mask (1=合法, 0=非法)
+        action_mask = obs.get("action_mask", None)
+        if action_mask is not None:
+            action_mask = action_mask.to(distribution.distribution.logits.device)
+            # 若整行全 0，避免 -inf 全部變 NaN → fallback 全設為 1
+            all_zero = (action_mask.sum(dim=1) == 0)
+            if all_zero.any():
+                action_mask[all_zero] = 1.0
+
+            # 將非法行動 logits 大幅降權
+            # distribution.distribution.logits shape: (batch, n_actions)
+            logits = distribution.distribution.logits
+            logits = logits + (action_mask - 1) * 1e9
+            distribution.distribution.logits = logits
+
+        # 取動作
+        actions = distribution.get_actions(deterministic=deterministic)
+        log_prob = distribution.log_prob(actions)
+        values = self.value_net(latent_vf)
+        return actions, values, log_prob
+    def _get_latent(self, features: torch.Tensor):
+        """
+        拷貝自 ActorCriticPolicy，unpack MlpExtractor 的 policy/value latent。
+        """
+        # mlp_extractor 回傳 (latent_pi, latent_vf)
+        latent_pi, latent_vf = self.mlp_extractor(features)
+        # 如果不用 SDE，可以回 None
+        latent_sde = None
+        return latent_pi, latent_vf, latent_sde
+
+    def _predict(self, observation, deterministic: bool = False):
+        """
+        SB3 用來在 rollout 時快速取得動作。
+        確保與 forward 一致（只取動作，不回傳 value/log_prob）。
+        """
+        features = self.extract_features(observation)
+        latent_pi, latent_vf, latent_sde = self._get_latent(features)
+        distribution = self._get_action_dist_from_latent(latent_pi)
+
+        action_mask = observation.get("action_mask", None)
+        if action_mask is not None:
+            action_mask = action_mask.to(distribution.distribution.logits.device)
+            all_zero = (action_mask.sum(dim=1) == 0)
+            if all_zero.any():
+                action_mask[all_zero] = 1.0
+            logits = distribution.distribution.logits
+            logits = logits + (action_mask - 1) * 1e9
+            distribution.distribution.logits = logits
+
+        return distribution.get_actions(deterministic=deterministic)
 
 def make_env(rank, seed=0):
     """
@@ -272,7 +333,7 @@ def main():
     register(id='ConnectFour-v0', entry_point='connectFour:ConnectFourEnv')
     
     # 設置參數
-    num_cpu = 1
+    num_cpu = 6
     total_timesteps = 3_000_000
     print(f"使用 {num_cpu} 個並行環境進行訓練")
     

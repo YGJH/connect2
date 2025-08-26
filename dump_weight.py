@@ -5,14 +5,16 @@ import io
 import base64
 import argparse
 import os
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+from stable_baselines3.common.policies import ActorCriticPolicy
 
 # DictTransformerExtractor class (matches training code, hard-coded board_dim=42)
-class DictTransformerExtractor(nn.Module):
-    def __init__(self, observation_space=None, features_dim=128, d_model=64, num_layers=14, num_heads=16, mark_emb_dim=8):
-        super().__init__()
-        board_dim = 42  # 6x7 Connect Four board
+class DictTransformerExtractor(BaseFeaturesExtractor):
+    def __init__(self, observation_space, features_dim=1024, d_model=64, num_layers=14, num_heads=16, mark_emb_dim=8):
+        super().__init__(observation_space, features_dim)
+        board_dim = observation_space.spaces["board"].shape[0]
         self.d_model = d_model
-        assert d_model % num_heads == 0, f"d_model ({d_model}) must be divisible by num_heads ({num_heads})"
+        assert d_model % num_heads == 0
         self.mark_embedding = nn.Embedding(2, mark_emb_dim)
         self.input_projection = nn.Linear(board_dim + mark_emb_dim, d_model)
         encoder_layer = nn.TransformerEncoderLayer(
@@ -32,30 +34,77 @@ class DictTransformerExtractor(nn.Module):
         x = self.transformer(x).squeeze(1)
         return self.out(x)
 
-# ConnectFourPolicy class (matches DictTransformerPolicy from training)
-class ConnectFourPolicy(nn.Module):
-    def __init__(self, observation_space=None, action_space=None, net_arch=[128, 128], features_dim=128,
-                 d_model=64, num_layers=14, num_heads=16, mark_emb_dim=8):
-        super().__init__()
-        action_dim = 7  # Connect Four has 7 columns
-        self.features_extractor = DictTransformerExtractor(
-            observation_space=observation_space, features_dim=features_dim, d_model=d_model,
-            num_layers=num_layers, num_heads=num_heads, mark_emb_dim=mark_emb_dim
+class DictTransformerPolicy(ActorCriticPolicy):
+    def __init__(self, observation_space, action_space, lr_schedule, **kwargs):
+        super().__init__(
+            observation_space,
+            action_space,
+            lr_schedule,
+            features_extractor_class=DictTransformerExtractor,
+            features_extractor_kwargs=dict(features_dim=128, d_model=16*24, num_layers=14, num_heads=16),
+            **kwargs
         )
-        self.mlp_extractor = nn.ModuleDict({
-            'policy_net': nn.Sequential(
-                nn.Linear(features_dim, net_arch[0]),
-                nn.ReLU(),
-                nn.Linear(net_arch[0], net_arch[1]),
-                nn.ReLU()
-            )
-        })
-        self.action_net = nn.Linear(net_arch[-1], action_dim)
 
-    def forward(self, observations):
-        features = self.features_extractor(observations)
-        latent_pi = self.mlp_extractor.policy_net(features)
-        return self.action_net(latent_pi)
+    def forward(self, obs, deterministic: bool = False):
+        """
+        obs: dict of tensors (已由 SB3 處理成 torch.Tensor)
+        回傳: actions, values, log_prob (與 ActorCriticPolicy 約定一致)
+        """
+        # 取得 latent
+        features = self.extract_features(obs)
+        latent_pi, latent_vf, latent_sde = self._get_latent(features)
+        distribution = self._get_action_dist_from_latent(latent_pi)
+
+        # 取得 action mask (1=合法, 0=非法)
+        action_mask = obs.get("action_mask", None)
+        if action_mask is not None:
+            action_mask = action_mask.to(distribution.distribution.logits.device)
+            # 若整行全 0，避免 -inf 全部變 NaN → fallback 全設為 1
+            all_zero = (action_mask.sum(dim=1) == 0)
+            if all_zero.any():
+                action_mask[all_zero] = 1.0
+
+            # 將非法行動 logits 大幅降權
+            # distribution.distribution.logits shape: (batch, n_actions)
+            logits = distribution.distribution.logits
+            logits = logits + (action_mask - 1) * 1e9
+            distribution.distribution.logits = logits
+
+        # 取動作
+        actions = distribution.get_actions(deterministic=deterministic)
+        log_prob = distribution.log_prob(actions)
+        values = self.value_net(latent_vf)
+        return actions, values, log_prob
+    def _get_latent(self, features: torch.Tensor):
+        """
+        拷貝自 ActorCriticPolicy，unpack MlpExtractor 的 policy/value latent。
+        """
+        # mlp_extractor 回傳 (latent_pi, latent_vf)
+        latent_pi, latent_vf = self.mlp_extractor(features)
+        # 如果不用 SDE，可以回 None
+        latent_sde = None
+        return latent_pi, latent_vf, latent_sde
+
+    def _predict(self, observation, deterministic: bool = False):
+        """
+        SB3 用來在 rollout 時快速取得動作。
+        確保與 forward 一致（只取動作，不回傳 value/log_prob）。
+        """
+        features = self.extract_features(observation)
+        latent_pi, latent_vf, latent_sde = self._get_latent(features)
+        distribution = self._get_action_dist_from_latent(latent_pi)
+
+        action_mask = observation.get("action_mask", None)
+        if action_mask is not None:
+            action_mask = action_mask.to(distribution.distribution.logits.device)
+            all_zero = (action_mask.sum(dim=1) == 0)
+            if all_zero.any():
+                action_mask[all_zero] = 1.0
+            logits = distribution.distribution.logits
+            logits = logits + (action_mask - 1) * 1e9
+            distribution.distribution.logits = logits
+
+        return distribution.get_actions(deterministic=deterministic)
 
 def dump_policy_to_py(model_path, output_path):
     # Load PPO model
@@ -68,27 +117,50 @@ def dump_policy_to_py(model_path, output_path):
     # Filter state_dict to include only policy-related keys and map prefixes
     full_state_dict = policy.state_dict()
     filtered_state_dict = {}
-    for key, value in full_state_dict.items():
-        if 'value_net' in key or 'vf_features_extractor' in key:
-            continue
+    # for key, value in full_state_dict.items():
+    #     if 'value_net' in key or 'vf_features_extractor' in key:
+    #         continue
         
-        # Map pi_features_extractor to features_extractor
+    #     # Map pi_features_extractor to features_extractor
+    #     if key.startswith('pi_features_extractor.'):
+    #         new_key = key.replace('pi_features_extractor.', 'features_extractor.')
+    #         filtered_state_dict[new_key] = value
+    #     # Map numerical indices to named layers
+    #     elif key == 'mlp_extractor.policy_net.0.weight':
+    #         filtered_state_dict['mlp_extractor.policy_net.0.weight'] = value
+    #     elif key == 'mlp_extractor.policy_net.0.bias':
+    #         filtered_state_dict['mlp_extractor.policy_net.0.bias'] = value
+    #     elif key == 'mlp_extractor.policy_net.2.weight':
+    #         filtered_state_dict['mlp_extractor.policy_net.2.weight'] = value
+    #     elif key == 'mlp_extractor.policy_net.2.bias':
+    #         filtered_state_dict['mlp_extractor.policy_net.2.bias'] = value
+    #     else:
+    #         filtered_state_dict[key] = value
+
+    # 只保留 policy 相關參數，並改 key 以匹配 submission.py 裡的 nn.Module
+    full_state_dict = policy.state_dict()
+    filtered_state_dict = {}
+    for key, value in full_state_dict.items():
+        # 跳過 value net 及其 extractor
+        if key.startswith('value_net') or key.startswith('vf_features_extractor'):
+            continue
+
+        # features extractor
         if key.startswith('pi_features_extractor.'):
             new_key = key.replace('pi_features_extractor.', 'features_extractor.')
             filtered_state_dict[new_key] = value
-        # Map numerical indices to named layers
-        elif key == 'mlp_extractor.policy_net.0.weight':
-            filtered_state_dict['mlp_extractor.policy_net.0.weight'] = value
-        elif key == 'mlp_extractor.policy_net.0.bias':
-            filtered_state_dict['mlp_extractor.policy_net.0.bias'] = value
-        elif key == 'mlp_extractor.policy_net.2.weight':
-            filtered_state_dict['mlp_extractor.policy_net.2.weight'] = value
-        elif key == 'mlp_extractor.policy_net.2.bias':
-            filtered_state_dict['mlp_extractor.policy_net.2.bias'] = value
-        else:
+            continue
+
+        # policy mlp layers: mlp_extractor.policy_net.X → policy_net.X
+        if key.startswith('mlp_extractor.policy_net.'):
+            new_key = key.replace('mlp_extractor.policy_net.', 'policy_net.')
+            filtered_state_dict[new_key] = value
+            continue
+
+        # action head
+        if key.startswith('action_net.'):
             filtered_state_dict[key] = value
-
-
+            continue
     # Save filtered state_dict to bytes buffer
     buffer = io.BytesIO()
     torch.save(filtered_state_dict, buffer)
@@ -106,15 +178,15 @@ def dump_policy_to_py(model_path, output_path):
 # Kaggle ConnectX agent generated from PPO model
 import torch
 import torch.nn as nn
+import numpy as np
 import base64
 import io
 
 # DictTransformerExtractor class
 class DictTransformerExtractor(nn.Module):
-    def __init__(self, observation_space=None, features_dim=128, d_model=64, num_layers=14, num_heads=16, mark_emb_dim=8):
+    def __init__(self, features_dim=128, d_model=384, num_layers=14, num_heads=16, mark_emb_dim=8):
         super().__init__()
         board_dim = 42  # 6x7 Connect Four board
-        self.d_model = d_model
         assert d_model % num_heads == 0, f"d_model ({{d_model}}) must be divisible by num_heads ({{num_heads}})"
         self.mark_embedding = nn.Embedding(2, mark_emb_dim)
         self.input_projection = nn.Linear(board_dim + mark_emb_dim, d_model)
@@ -135,31 +207,30 @@ class DictTransformerExtractor(nn.Module):
         x = self.transformer(x).squeeze(1)
         return self.out(x)
 
-# ConnectFourPolicy class
+# Simple policy as nn.Module
 class ConnectFourPolicy(nn.Module):
-    def __init__(self, observation_space=None, action_space=None, net_arch=[128, 128], features_dim=128,
-                 d_model=64, num_layers=14, num_heads=16, mark_emb_dim=8):
+    def __init__(self):
         super().__init__()
-        action_dim = 7  # Connect Four has 7 columns
+        # extractor 與訓練時一樣
         self.features_extractor = DictTransformerExtractor(
-            observation_space=observation_space, features_dim=features_dim, d_model=d_model,
-            num_layers=num_layers, num_heads=num_heads, mark_emb_dim=mark_emb_dim
+            features_dim=128, d_model=384, num_layers=14, num_heads=16
         )
-        self.mlp_extractor = nn.ModuleDict({{
-            'policy_net': nn.Sequential(
-                nn.Linear(features_dim, net_arch[0]),
-                nn.ReLU(),
-                nn.Linear(net_arch[0], net_arch[1]),
-                nn.ReLU()
-            )
-        }})
-        self.action_net = nn.Linear(net_arch[-1], action_dim)
+        # net_arch=[512]*6
+        dims = [512] * 6
+        layers = []
+        in_dim = 128
+        for out_dim in dims:
+            layers.append(nn.Linear(in_dim, out_dim))
+            layers.append(nn.ReLU())
+            in_dim = out_dim
+        self.policy_net = nn.Sequential(*layers)
+        # action head: 512 → 7
+        self.action_net = nn.Linear(512, 7)
 
     def forward(self, observations):
         features = self.features_extractor(observations)
-        latent_pi = self.mlp_extractor.policy_net(features)
+        latent_pi = self.policy_net(features)
         return self.action_net(latent_pi)
-
 # Load model weights
 try:
     model = ConnectFourPolicy()
@@ -172,40 +243,31 @@ try:
 except Exception as e:
     raise RuntimeError(f"Failed to load model weights: {{e}}")
 
-# Agent function for Kaggle ConnectX
+# Kaggle ConnectX agent function
 def agent(observation, configuration):
-    try:
-        # Convert observation to tensors
-        board = torch.tensor(observation['board'], dtype=torch.float).unsqueeze(0)  # Shape: (1, 42)
-        mark = torch.tensor([observation['mark']], dtype=torch.float).unsqueeze(0)  # Shape: (1, 1)
-        obs_dict = {{"board": board, "mark": mark}}
-        
-        # Get action logits
-        with torch.no_grad():
-            logits = model(obs_dict)[0]  # Shape: (7,)
-        
-        # Mask invalid actions (columns that are full)
-        board_2d = torch.tensor(observation['board']).reshape(6, 7)
-        valid_actions = [i for i in range(7) if board_2d[0, i] == 0]
-        if not valid_actions:
-            return 0  # Fallback to column 0 if no valid actions
-        
-        # Apply mask to logits
-        masked_logits = torch.full_like(logits, float('-inf'))
-        for action in valid_actions:
-            masked_logits[action] = logits[action]
-        
-        # Select action with highest logit
-        action = torch.argmax(masked_logits).item()
-        
-        # Ensure action is valid
-        if action not in valid_actions:
-            action = valid_actions[0]  # Fallback to first valid action
-        return action
-    except Exception as e:
-        print(f"Agent error: {{e}}")
-        return 0  # Fallback action
+    # Prepare obs dict
+    board = torch.tensor(observation['board'], dtype=torch.float).unsqueeze(0)
+    mark = torch.tensor([observation['mark']], dtype=torch.float).unsqueeze(0)
+    action_mask = np.zeros(configuration.columns, dtype=np.float32)
+    # build mask
+    board2d = board.view(6,7)
+    for col in range(7):
+        if board2d[0, col] == 0:
+            action_mask[col] = 1.0
+    obs_dict = {{"board": board, "mark": mark}}
+
+    # forward
+    with torch.no_grad():
+        logits = model(obs_dict)[0]  # (7,)
+    # mask invalid
+    masked = logits.numpy() + (action_mask - 1)*1e9
+    action = int(masked.argmax())
+    return action
 """
+
+    # board = torch.tensor(observation['board'], dtype=torch.float).unsqueeze(0)
+    # mark = torch.tensor([observation['mark']], dtype=torch.float).unsqueeze(0)
+    # action_mask = np.zeros(configuration['columns'], dtype=np.float32)
 
     # Write to output file
     try:

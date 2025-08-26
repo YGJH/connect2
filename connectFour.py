@@ -26,7 +26,8 @@ class ConnectFourEnv(gym.Env):
         self.label = 1
         self.observation_space = spaces.Dict({
             "board": spaces.Box(low=0, high=2, shape=(self.height * self.width,), dtype=np.float32),
-            "mark": spaces.Box(low=1, high=2, shape=(1,), dtype=np.float32)
+            "mark": spaces.Box(low=1, high=2, shape=(1,), dtype=np.float32),
+            "action_mask": spaces.Box(low=0, high=1, shape=(self.width,), dtype=np.float32)
         })
         self.folder_path = 'opponents'
         self.opponent_list = [self.load_agent(f) for f in os.listdir(os.path.join(self.folder_path)) if f.endswith('.py')]
@@ -38,11 +39,15 @@ class ConnectFourEnv(gym.Env):
         self.config = {"rows": self.height, "columns": self.width, "inarow": self.connect}
 
     def _get_obs(self, b=None):
+        action_mask = np.zeros(self.width, dtype=np.float32)
+        for col in range(self.width):
+            if self._is_valid_action(col):
+                action_mask[col] = 1.0
         return {
             "board": self.board.flatten(),
-            "mark": np.array([self.label], dtype=np.float32)
+            "mark": np.array([self.label], dtype=np.float32),
+            "action_mask": action_mask
         }
-
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         self.board.fill(0)
