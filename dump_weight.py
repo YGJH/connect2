@@ -295,7 +295,7 @@ def agent(observation, configuration):
         model.load_state_dict(state_dict)
         print("Verified: agent.py contains a callable 'agent' function and model loads successfully.")
     except Exception as e:
-        raise ValueError(f"Failed to verify agent.py: {e}")
+        raise ValueError(f"Failed to verify: {e}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Dump PPO policy to self-contained agent.py for Kaggle ConnectX")

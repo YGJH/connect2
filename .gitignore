@@ -9,7 +9,8 @@ wheels/
 opponent/
 opponents/
 videos/
-
+submission.py
+submission**
 
 # Virtual environments
 .venv

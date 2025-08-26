@@ -11,7 +11,10 @@ import math
 
 class ConnectFourEnv(gym.Env):
     metadata = {"render_modes": ["human", "ansi"], "render_fps": 20}
-
+    class Config:
+        columns = 7
+        rows = 6
+        inarow = 4
     def __init__(self, width=7, height=6, connect=4, render_mode=None):
         super().__init__()
         self.win_count = 0
@@ -24,6 +27,8 @@ class ConnectFourEnv(gym.Env):
         self.current_player = 1
         self.last_info = None
         self.label = 1
+        self._renderer = None
+
         self.observation_space = spaces.Dict({
             "board": spaces.Box(low=0, high=2, shape=(self.height * self.width,), dtype=np.float32),
             "mark": spaces.Box(low=1, high=2, shape=(1,), dtype=np.float32),
@@ -36,7 +41,7 @@ class ConnectFourEnv(gym.Env):
         print(temp)
         self.render_mode = render_mode
         self.action_space = spaces.Discrete(self.width)
-        self.config = {"rows": self.height, "columns": self.width, "inarow": self.connect}
+        self.config = ConnectFourEnv.Config()
 
     def _get_obs(self, b=None):
         action_mask = np.zeros(self.width, dtype=np.float32)
@@ -52,9 +57,9 @@ class ConnectFourEnv(gym.Env):
         super().reset(seed=seed)
         self.board.fill(0)
         self.episode_count += 1
-        self.label = 1
         # 確保是 1 或 2
         self.current_player = (self.games_count % 2) + 1
+        self.label = 1  # Add this line
         self.step_count = 0
         gc.collect()
 
@@ -68,18 +73,18 @@ class ConnectFourEnv(gym.Env):
             self._opponent_name_cached = 'self_play'
         elif callable(self.opponent):
             self._opponent_name_cached = getattr(self.opponent, "_source_file",
-                                                 getattr(self.opponent, "_source_file", "callable_opponent"))
+                                                getattr(self.opponent, "_source_file", "callable_opponent"))
         else:
             self._opponent_name_cached = str(self.opponent)
 
-        # 如果對手先手 (設定為 current_player == 1 視作對手)
-        if self.current_player == 1:
-            # 讓對手落子
-            obs, reward, terminated, truncated, info = self.step(None)
-            if terminated or truncated:
-                # 立即結束 (極少見，但保險)
-                self.games_count += 1
-                return obs, {}
+        # Remove/comment out this block:
+        # if self.current_player == 1:
+        #     # 讓對手落子
+        #     obs, reward, terminated, truncated, info = self.step(None)
+        #     if terminated or truncated:
+        #         # 立即結束 (極少見，但保險)
+        #         self.games_count += 1
+        #         return obs, {}
         self.games_count += 1
         if self.games_count % 200 == 0:
             print(f'win_rate: {(self.win_count / self.games_count):.3f}')
@@ -107,12 +112,23 @@ class ConnectFourEnv(gym.Env):
         setattr(agent, "_source_file", file_path)
         return agent
 
+    # def _get_opponent_action(self):
+    #     temp = self._get_obs()
+    #     temp['board'] = temp['board'].astype(np.int8)
+    #     temp['mark'] = temp['mark'].astype(np.int8).tolist()[0]
+    #     return self.opponent(temp, self.config)
     def _get_opponent_action(self):
         temp = self._get_obs()
-        temp['board'] = temp['board'].astype(np.int8)
+        temp['board'] = temp['board'].astype(np.int8).tolist()
         temp['mark'] = temp['mark'].astype(np.int8).tolist()[0]
-        return self.opponent(temp, self.config)
-
+        try:
+            action = self.opponent(temp, self.config)
+        except Exception as e:
+            print(f"[get_opponent_action] Opponent error: {e}, falling back to random action")
+            valid_actions = np.where(temp['action_mask'] == 1)[0]
+            action = np.random.choice(valid_actions) if len(valid_actions) > 0 else 0
+        return action    
+        
     def step(self, action):
         self.step_count = getattr(self, 'step_count', 0) + 1
 
@@ -135,13 +151,11 @@ class ConnectFourEnv(gym.Env):
                 if self._is_draw():
                     info.update({'game_result': 'draw'})
                     info.update({'evaluation': -0.1})
-
                     return self._get_obs(), -0.1, True, False, info
                 # 換我方
-                self.current_player = 2
-                self.label = 2
+                self.current_player = 3 - self.current_player
+                self.label = 3 - self.label
                 info.update({'evaluation': 0.07})
-
                 return self._get_obs(), 0.07, False, False, info
             else:
                 # 外部對手
@@ -165,19 +179,17 @@ class ConnectFourEnv(gym.Env):
                 self.current_player = 2
                 self.label = 2
                 info.update({'evaluation': 0.07})
-
                 return self._get_obs(), 0.07, False, False, info
 
         # 我方行動 (current_player == 2)
+        info = self._get_info()
         if not self._is_valid_action(action):
-            info = self._get_info()
             info.update({'game_result': 'loss', 'winner': 1})
+            info.update({'evaluation': -10000.0})
             return self._get_obs(), -10000.0, True, False, info
 
         row = self._next_open_row(action)
-        self.board[row, action] = self.label  # self.label 應為 2
-        info = self._get_info()
-
+        self.board[row, action] = self.label
         if self._is_winner(self.label):
             self.win_count += 1
             info.update({'evaluation': 2})
@@ -189,13 +201,11 @@ class ConnectFourEnv(gym.Env):
             return self._get_obs(), -0.1, True, False, info
 
         # 換對手
-        self.current_player = 1
-        self.label = 1
+        self.current_player = 3 - self.current_player
+        self.label = 3 - self.label
         info.update({'evaluation': 0.07})
-
-        # 若自對弈則不自動馬上再呼叫 step(None)，讓外部控制流程；若想自動可遞迴
         return self._get_obs(), 0.07, False, False, info
-
+        
     def _is_valid_action(self, action):
         if action is None or not isinstance(action, (int, np.integer)) or action < 0 or action >= self.width:
             return False
@@ -265,37 +275,36 @@ class ConnectFourEnv(gym.Env):
 
         # Human mode with pygame
     def render(self, mode='human'):
-        self.opponent = self.load_agent('submission_vMega.py')
+        # ASCII 模式
         if mode == 'ansi':
             print("\n" + "=" * (self.width * 4 + 1))
             for r in range(self.height):
                 row_str = "|"
                 for c in range(self.width):
                     v = self.board[r, c]
-                    if v == 1:
-                        row_str += " R |"  # Red for first player
-                    elif v == 2:
-                        row_str += " Y |"  # Yellow for second player
-                    else:
-                        row_str += "   |"
+                    row_str += " R |" if v == 1 else " Y |" if v == 2 else "   |"
                 print(row_str)
             print("=" * (self.width * 4 + 1))
             print(" " + " ".join([f" {i} " for i in range(self.width)]))
-            
-            # 顯示當前狀態
-            player_name = "submission_vMega" if self.current_player == 1 else "RL Agent"
-            print(f"🎯 Current turn: {player_name} (Player {self.current_player})")
-            print(f"📊 Win rate: {(self.win_count / self.games_count if self.games_count > 0 else 0):.3f}")
             return
-        else:
-            # Human mode with pygame
-            renderer = ConnectFourRenderer()
-            renderer.render(self.board, self.current_player, self.win_count, self.games_count)
 
+        # Human/pygame 模式
+        if self._renderer is None:
+            # 第一次调用时创建并缓存
+            self._renderer = ConnectFourRenderer(self.width, self.height, self._opponent_name_cached)
+        # 将最新的棋盘状态、当前玩家和统计值传给渲染器
+        self._renderer.render(self.board, self.current_player, self.win_count, self.games_count)
+    def close(self):
+        if self._renderer and self._renderer.pygame_initialized:
+            pygame.quit()
+            self._renderer.pygame_initialized = False  # 重置狀態，避免重複 quit
+        self._renderer = None
+        super().close()  # 呼叫 gym 的 default close
 class ConnectFourRenderer:
-    def __init__(self, width=7, height=6):
+    def __init__(self, width=7, height=6, _opponent_name_cached='Piyan'):
         self.width = width
         self.height = height
+        self._opponent_name_cached = _opponent_name_cached
         self.pygame_initialized = False
         self.animations = []  # Store animation states
         self.particles = []   # Store particle effects
@@ -332,7 +341,7 @@ class ConnectFourRenderer:
                                 self.TOP_MARGIN + self.BOTTOM_MARGIN)
 
             self.screen = pygame.display.set_mode((self.screen_width, self.screen_height))
-            pygame.display.set_caption("🔴🟡 Connect Four - Cyber Edition")
+            pygame.display.set_caption("🔴🟡 Connect Four - "+ self._opponent_name_cached)
             self.clock = pygame.time.Clock()
 
             # Fonts (use a modern system font or fallback)
@@ -403,8 +412,7 @@ class ConnectFourRenderer:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 pygame.quit()
-                sys.exit()
-
+                return
         # Update animations and particles
         self.update_animations()
         self.update_particles()
@@ -428,14 +436,14 @@ class ConnectFourRenderer:
 
         # Draw player info with icons
         player1_text = "🔴 Player 1: CyberBot"
-        player2_text = "🟡 Player 2: AI Agent"
+        player2_text = "🟡 Player 2: " + self._opponent_name_cached
         p1_surface = self.font_medium.render(player1_text, True, self.COLORS['player1'])
         p2_surface = self.font_medium.render(player2_text, True, self.COLORS['player2'])
         self.screen.blit(p1_surface, (20, 60))
         self.screen.blit(p2_surface, (20, 90))
 
         # Draw current turn with glow
-        current_player_name = "CyberBot" if self.current_player == 1 else "AI Agent"
+        current_player_name = self._opponent_name_cached if self.current_player == 1 else "AI Agent"
         turn_text = f"🎯 Turn: {current_player_name}"
         turn_color = self.COLORS['player1'] if self.current_player == 1 else self.COLORS['player2']
         turn_surface = self.font_medium.render(turn_text, True, turn_color)

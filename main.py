@@ -51,10 +51,6 @@ class DictTransformerPolicy(ActorCriticPolicy):
         )
 
     def forward(self, obs, deterministic: bool = False):
-        """
-        obs: dict of tensors (已由 SB3 處理成 torch.Tensor)
-        回傳: actions, values, log_prob (與 ActorCriticPolicy 約定一致)
-        """
         # 取得 latent
         features = self.extract_features(obs)
         latent_pi, latent_vf, latent_sde = self._get_latent(features)
@@ -62,18 +58,21 @@ class DictTransformerPolicy(ActorCriticPolicy):
 
         # 取得 action mask (1=合法, 0=非法)
         action_mask = obs.get("action_mask", None)
+        
+        # print(action_mask)
         if action_mask is not None:
             action_mask = action_mask.to(distribution.distribution.logits.device)
             # 若整行全 0，避免 -inf 全部變 NaN → fallback 全設為 1
             all_zero = (action_mask.sum(dim=1) == 0)
             if all_zero.any():
+                # print(f"[DictTransformerPolicy] Warning: action_mask all zeros for some observations")
                 action_mask[all_zero] = 1.0
 
             # 將非法行動 logits 大幅降權
-            # distribution.distribution.logits shape: (batch, n_actions)
             logits = distribution.distribution.logits
             logits = logits + (action_mask - 1) * 1e9
             distribution.distribution.logits = logits
+            # print(f"[DictTransformerPolicy] Logits after masking: {logits}")
 
         # 取動作
         actions = distribution.get_actions(deterministic=deterministic)
@@ -196,27 +195,38 @@ class EvaluationCallback(BaseCallback):
 
 
 
-    def visualize_model(model, num_episodes=5):
-        """使用單個環境進行可視化"""
+    def visualize_model(model, num_episodes=1):
         env = gym.make('ConnectFour-v0', render_mode='human')
-
-        for ep in range(num_episodes):
-            obs, _ = env.reset()
-            terminated = False
-            truncated = False
-            total_reward = 0.0
-            steps = 0
-            print(f"Visualization Episode {ep+1}")
-            while not (terminated or truncated):
-                action, _ = model.predict(obs, deterministic=True)
-                obs, reward, terminated, truncated, info = env.step(action)
-                total_reward += reward
-                steps += 1
-                env.render()
-                time.sleep(0.5)
+        try:
+            for ep in range(num_episodes):
+                obs, _ = env.reset()
+                terminated = False
+                truncated = False
+                total_reward = 0.0
+                steps = 0
+                print(f"Visualization Episode {ep+1}")
+                while not (terminated or truncated):
+                    action, _ = model.predict(obs, deterministic=True)
+                    action = int(action.item())
+                    mask = obs["action_mask"]
+                    valid_actions = np.where(mask == 1)[0]
+                    if mask[action] == 0:
+                        if len(valid_actions) > 0:
+                            action = int(np.random.choice(valid_actions))
+                        else:
+                            terminated = True
+                            break
+                    obs, reward, terminated, truncated, info = env.step(action)
+                    total_reward += reward
+                    steps += 1
+                    env.render()
+                    time.sleep(0.5)
             print(f"Episode {ep+1} reward={total_reward} steps={steps}")
-        env.close()
-
+        finally:
+            env.close()  # 確保無論如何都 close
+            time.sleep(1)  # 給 Pygame quit 時間
+        
+    
     def _evaluate_and_log(self):
         if len(self.rewards) < 100:
             return
@@ -259,8 +269,7 @@ class EvaluationCallback(BaseCallback):
                 log_info += f"\n  - {opponent}: {opp_wr:.3f} ({stats['wins']}/{stats['games']})"
 
         print(log_info)
-        if total_games % 1000 == 0:
-            visualize_model(self.model, num_episodes=1)
+        visualize_model(self.model, num_episodes=1)
 
         if mean_reward > self.best_mean_reward:
             self.best_mean_reward = mean_reward
@@ -301,6 +310,7 @@ def send_telegram(msg: str):
         print(f"Telegram 發送失敗: {e}")
 
 
+
 def visualize_model(model, num_episodes=5):
     """使用單個環境進行可視化"""
     env = gym.make('ConnectFour-v0', render_mode='human')
@@ -313,14 +323,33 @@ def visualize_model(model, num_episodes=5):
         steps = 0
         print(f"Visualization Episode {ep+1}")
         while not (terminated or truncated):
+            # SB3 predict，obs 是 dict，policy 会用 action_mask 过滤
             action, _ = model.predict(obs, deterministic=True)
+            action = int(action.item())  # Convert to scalar int
+            # Check action mask for validity
+            mask = obs["action_mask"]
+            valid_actions = np.where(mask == 1)[0]
+            if mask[action] == 0:
+                if len(valid_actions) > 0:
+                    action = int(np.random.choice(valid_actions))
+                    print(f"[visualize_model] Invalid action {action} predicted, fallback to random valid action={action}")
+                else:
+                    print("[visualize_model] No valid actions available (board likely full), forcing termination")
+                    terminated = True
+                    break
+            # Log action details
+            # print(f"[visualize_model] Step {steps+1}: current_player={env.current_player}, action={action}, mask={mask}")
+            # 交给环境
             obs, reward, terminated, truncated, info = env.step(action)
             total_reward += reward
             steps += 1
+            # 调用带 mode 的 render，强制走 pygame 路径
             env.render()
-            time.sleep(0.5)
-        print(f"Episode {ep+1} reward={total_reward} steps={steps}")
+            print(f"[visualize_model] Reward={reward}, Terminated={terminated}, Truncated={truncated}, Info={info}")
+            time.sleep(0.5)        
+    print(f"Episode {ep+1} reward={total_reward} steps={steps}")
     env.close()
+
 
 def main():
     import argparse
@@ -334,6 +363,7 @@ def main():
     
     # 設置參數
     num_cpu = 6
+    
     total_timesteps = 3_000_000
     print(f"使用 {num_cpu} 個並行環境進行訓練")
     
@@ -348,7 +378,7 @@ def main():
         DictTransformerPolicy,
         env,
         verbose=1,
-        n_steps=100 // num_cpu,
+        n_steps=2048 // num_cpu,
         batch_size=256,
         n_epochs=10,
         learning_rate=3e-4,
@@ -357,7 +387,7 @@ def main():
     )
     
     # 創建改進的回調
-    callback = EvaluationCallback(verbose=1, eval_freq=1000, save_freq=10000)
+    callback = EvaluationCallback(verbose=1, eval_freq=1000)
 
     if model_path:
         model.load(model_path)
@@ -379,4 +409,5 @@ def main():
     visualize_model(model, num_episodes=10)
 
 if __name__ == '__main__':
+    # multiprocessing.set_start_method('spawn')  # 強制用 spawn，避免 fork 問題
     main()
