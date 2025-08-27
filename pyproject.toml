@@ -7,7 +7,9 @@ requires-python = ">=3.12"
 dependencies = [
     "kaggle-environments==0.1.4",
     "nuitka>=2.7.13",
+    "pybloom-live>=4.0.0",
     "pyqt5>=5.15.11",
+    "redis>=6.4.0",
     "stable-baselines3[extra]>=2.7.0",
     "torch>=2.8.0",
     "tqdm>=4.67.1",

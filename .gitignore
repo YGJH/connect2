@@ -11,6 +11,8 @@ opponents/
 videos/
 submission.py
 submission**
+checkpoints/
+*.pkl
 
 # Virtual environments
 .venv

@@ -114,29 +114,6 @@ def dump_policy_to_py(model_path, output_path):
         raise ValueError(f"Failed to load model from {model_path}: {e}")
     policy = model.policy
 
-    # Filter state_dict to include only policy-related keys and map prefixes
-    full_state_dict = policy.state_dict()
-    filtered_state_dict = {}
-    # for key, value in full_state_dict.items():
-    #     if 'value_net' in key or 'vf_features_extractor' in key:
-    #         continue
-        
-    #     # Map pi_features_extractor to features_extractor
-    #     if key.startswith('pi_features_extractor.'):
-    #         new_key = key.replace('pi_features_extractor.', 'features_extractor.')
-    #         filtered_state_dict[new_key] = value
-    #     # Map numerical indices to named layers
-    #     elif key == 'mlp_extractor.policy_net.0.weight':
-    #         filtered_state_dict['mlp_extractor.policy_net.0.weight'] = value
-    #     elif key == 'mlp_extractor.policy_net.0.bias':
-    #         filtered_state_dict['mlp_extractor.policy_net.0.bias'] = value
-    #     elif key == 'mlp_extractor.policy_net.2.weight':
-    #         filtered_state_dict['mlp_extractor.policy_net.2.weight'] = value
-    #     elif key == 'mlp_extractor.policy_net.2.bias':
-    #         filtered_state_dict['mlp_extractor.policy_net.2.bias'] = value
-    #     else:
-    #         filtered_state_dict[key] = value
-
     # 只保留 policy 相關參數，並改 key 以匹配 submission.py 裡的 nn.Module
     full_state_dict = policy.state_dict()
     filtered_state_dict = {}
@@ -184,28 +161,83 @@ import io
 
 # DictTransformerExtractor class
 class DictTransformerExtractor(nn.Module):
-    def __init__(self, features_dim=128, d_model=384, num_layers=14, num_heads=16, mark_emb_dim=8):
+    def __init__(self, features_dim=128, d_model=128, num_layers=4, num_heads=8, mark_emb_dim=8, height=6, width=7, cnn_channels=[16, 32]):
         super().__init__()
-        board_dim = 42  # 6x7 Connect Four board
-        assert d_model % num_heads == 0, f"d_model ({{d_model}}) must be divisible by num_heads ({{num_heads}})"
+        self.height = height  # 6 rows
+        self.width = width   # 7 columns
+        self.seq_len = height * width  # 6*7=42
+        self.d_model = d_model
+        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
+        
+        # CNN backbone for spatial feature extraction
+        self.cnn_layers = nn.ModuleList()
+        in_channels = 3  # One-hot for 0=empty, 1=player1, 2=player2
+        for out_channels in cnn_channels:
+            self.cnn_layers.append(nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1))
+            self.cnn_layers.append(nn.ReLU())
+            in_channels = out_channels
+        
+        # CNN output: (B, cnn_channels[-1], height, width)
+        self.cnn_out_dim = cnn_channels[-1]  # e.g., 32
+        self.seq_len = height * width  # No downsampling: 6*7=42
+        
+        # Projection from CNN features to d_model
+        self.cnn_projection = nn.Linear(self.cnn_out_dim, d_model)
+        
+        # Mark embedding
         self.mark_embedding = nn.Embedding(2, mark_emb_dim)
-        self.input_projection = nn.Linear(board_dim + mark_emb_dim, d_model)
+        self.mark_projection = nn.Linear(mark_emb_dim, d_model)
+        
+        # Positional encoding for sequence
+        self.pos_encoding = nn.Parameter(torch.randn(1, self.seq_len, d_model) * 0.02)
+        
+        # Transformer
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=num_heads, dim_feedforward=128, batch_first=True
+            d_model=d_model, nhead=num_heads, dim_feedforward=256, batch_first=True, norm_first=True
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        
+        # Output layer
         self.out = nn.Linear(d_model, features_dim)
 
     def forward(self, observations):
-        board = observations["board"]
-        mark = observations["mark"]
-        mark_idx = (mark.long() - 1).squeeze(-1)
-        mark_emb = self.mark_embedding(mark_idx)
-        x = torch.cat([board, mark_emb], dim=1)
-        x = self.input_projection(x)
-        x = x.unsqueeze(1)
-        x = self.transformer(x).squeeze(1)
-        return self.out(x)
+        board = observations["board"]  # (B, 42)
+        mark = observations["mark"]    # (B, 1)
+        B = board.shape[0]
+        
+        # Reshape board to 2D and one-hot encode: (B, 42) -> (B, 3, 6, 7)
+        board_int = board.long()
+        board_onehot = torch.zeros(B, 3, self.height, self.width, device=board.device)
+        board_onehot.scatter_(1, board_int.view(B, 1, self.height, self.width), 1)
+        x = board_onehot  # (B, 3, 6, 7)
+        
+        # Apply CNN layers
+        for layer in self.cnn_layers:
+            x = layer(x)  # (B, 32, 6, 7)
+        
+        # Flatten to sequence: (B, 32, 6, 7) -> (B, 42, 32)
+        x = x.flatten(2).transpose(1, 2)  # (B, 6*7, 32)
+        
+        # Project to d_model
+        x = self.cnn_projection(x)  # (B, 42, d_model)
+        
+        # Mark embedding and broadcast
+        mark_idx = (mark.long() - 1).squeeze(-1)  # (B,)
+        mark_emb = self.mark_embedding(mark_idx)  # (B, mark_emb_dim)
+        mark_emb = self.mark_projection(mark_emb).unsqueeze(1)  # (B, 1, d_model)
+        x += mark_emb  # Broadcast to all tokens: (B, 42, d_model)
+        
+        # Add positional encoding
+        x += self.pos_encoding  # (B, 42, d_model)
+        
+        # Transformer
+        x = self.transformer(x)  # (B, 42, d_model)
+        
+        # Global mean pooling
+        x = x.mean(dim=1)  # (B, d_model)
+        
+        # Output
+        return self.out(x)  # (B, features_dim)
 
 # Simple policy as nn.Module
 class ConnectFourPolicy(nn.Module):
@@ -213,7 +245,7 @@ class ConnectFourPolicy(nn.Module):
         super().__init__()
         # extractor 與訓練時一樣
         self.features_extractor = DictTransformerExtractor(
-            features_dim=128, d_model=384, num_layers=14, num_heads=16
+            features_dim=128, d_model=128, num_layers=4, num_heads=8, height=6, width=7, cnn_channels=[16, 32]
         )
         # net_arch=[512]*6
         dims = [512] * 6
@@ -264,10 +296,6 @@ def agent(observation, configuration):
     action = int(masked.argmax())
     return action
 """
-
-    # board = torch.tensor(observation['board'], dtype=torch.float).unsqueeze(0)
-    # mark = torch.tensor([observation['mark']], dtype=torch.float).unsqueeze(0)
-    # action_mask = np.zeros(configuration['columns'], dtype=np.float32)
 
     # Write to output file
     try:

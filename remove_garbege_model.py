@@ -1,6 +1,7 @@
 import os 
 import re
-
+import sys
+delete = sys.argv[1] if len(sys.argv) > 1 else None
 files = os.listdir()
 score_list = []
 for f in files:
@@ -20,5 +21,6 @@ if score_list:
     # Remove all other files
     for reward, filename in score_list:
         if filename != best_file:
-            # os.remove(filename)
+            if delete:
+                os.remove(filename)
             print(f"Removed: {filename}")

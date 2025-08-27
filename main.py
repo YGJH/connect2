@@ -11,33 +11,94 @@ from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
 from stable_baselines3.common.utils import set_random_seed
 import time
 
-import connectFour
 
-# 自訂 Transformer 特徵提取器
+
+import torch
+import torch.nn as nn
+from stable_baselines3.common.policies import ActorCriticPolicy
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+
+# 自訂 Transformer 特徵提取器 with CNN backbone
 class DictTransformerExtractor(BaseFeaturesExtractor):
-    def __init__(self, observation_space, features_dim=1024, d_model=64, num_layers=14, num_heads=16, mark_emb_dim=8):
+    def __init__(self, observation_space, features_dim=128, d_model=128, num_layers=4, num_heads=8, mark_emb_dim=8, height=6, width=7, cnn_channels=[16, 32]):
         super().__init__(observation_space, features_dim)
         board_dim = observation_space.spaces["board"].shape[0]
+        assert board_dim == height * width, f"Board dimension mismatch: expected {height*width}, got {board_dim}"
+        self.height = height  # 6 rows
+        self.width = width   # 7 columns
+        self.seq_len = height * width  # 6*7=42
         self.d_model = d_model
-        assert d_model % num_heads == 0
+        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
+        
+        # CNN backbone for spatial feature extraction
+        self.cnn_layers = nn.ModuleList()
+        in_channels = 3  # One-hot for 0=empty, 1=player1, 2=player2
+        for out_channels in cnn_channels:
+            self.cnn_layers.append(nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1))
+            self.cnn_layers.append(nn.ReLU())
+            in_channels = out_channels
+        
+        # CNN output: (B, cnn_channels[-1], height, width)
+        self.cnn_out_dim = cnn_channels[-1]  # e.g., 32
+        self.seq_len = height * width  # No downsampling: 6*7=42
+        
+        # Projection from CNN features to d_model
+        self.cnn_projection = nn.Linear(self.cnn_out_dim, d_model)
+        
+        # Mark embedding
         self.mark_embedding = nn.Embedding(2, mark_emb_dim)
-        self.input_projection = nn.Linear(board_dim + mark_emb_dim, d_model)
+        self.mark_projection = nn.Linear(mark_emb_dim, d_model)
+        
+        # Positional encoding for sequence
+        self.pos_encoding = nn.Parameter(torch.randn(1, self.seq_len, d_model) * 0.02)
+        
+        # Transformer
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=num_heads, dim_feedforward=128, batch_first=True
+            d_model=d_model, nhead=num_heads, dim_feedforward=256, batch_first=True, norm_first=True
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        
+        # Output layer
         self.out = nn.Linear(d_model, features_dim)
 
     def forward(self, observations):
-        board = observations["board"]
-        mark = observations["mark"]
-        mark_idx = (mark.long() - 1).squeeze(-1)
-        mark_emb = self.mark_embedding(mark_idx)
-        x = torch.cat([board, mark_emb], dim=1)
-        x = self.input_projection(x)
-        x = x.unsqueeze(1)
-        x = self.transformer(x).squeeze(1)
-        return self.out(x)
+        board = observations["board"]  # (B, 42)
+        mark = observations["mark"]    # (B, 1)
+        B = board.shape[0]
+        
+        # Reshape board to 2D and one-hot encode: (B, 42) -> (B, 3, 6, 7)
+        board_int = board.long()
+        board_onehot = torch.zeros(B, 3, self.height, self.width, device=board.device)
+        board_onehot.scatter_(1, board_int.view(B, 1, self.height, self.width), 1)
+        x = board_onehot  # (B, 3, 6, 7)
+        
+        # Apply CNN layers
+        for layer in self.cnn_layers:
+            x = layer(x)  # (B, 32, 6, 7)
+        
+        # Flatten to sequence: (B, 32, 6, 7) -> (B, 42, 32)
+        x = x.flatten(2).transpose(1, 2)  # (B, 6*7, 32)
+        
+        # Project to d_model
+        x = self.cnn_projection(x)  # (B, 42, d_model)
+        
+        # Mark embedding and broadcast
+        mark_idx = (mark.long() - 1).squeeze(-1)  # (B,)
+        mark_emb = self.mark_embedding(mark_idx)  # (B, mark_emb_dim)
+        mark_emb = self.mark_projection(mark_emb).unsqueeze(1)  # (B, 1, d_model)
+        x += mark_emb  # Broadcast to all tokens: (B, 42, d_model)
+        
+        # Add positional encoding
+        x += self.pos_encoding  # (B, 42, d_model)
+        
+        # Transformer
+        x = self.transformer(x)  # (B, 42, d_model)
+        
+        # Global mean pooling
+        x = x.mean(dim=1)  # (B, d_model)
+        
+        # Output
+        return self.out(x)  # (B, features_dim)
 
 class DictTransformerPolicy(ActorCriticPolicy):
     def __init__(self, observation_space, action_space, lr_schedule, **kwargs):
@@ -46,53 +107,55 @@ class DictTransformerPolicy(ActorCriticPolicy):
             action_space,
             lr_schedule,
             features_extractor_class=DictTransformerExtractor,
-            features_extractor_kwargs=dict(features_dim=128, d_model=16*24, num_layers=14, num_heads=16),
+            features_extractor_kwargs=dict(
+                features_dim=128,
+                d_model=128,
+                num_layers=4,
+                num_heads=8,
+                height=6,
+                width=7,
+                cnn_channels=[16, 32]
+            ),
             **kwargs
         )
 
     def forward(self, obs, deterministic: bool = False):
-        # 取得 latent
+        # Extract features
         features = self.extract_features(obs)
         latent_pi, latent_vf, latent_sde = self._get_latent(features)
         distribution = self._get_action_dist_from_latent(latent_pi)
 
-        # 取得 action mask (1=合法, 0=非法)
+        # Apply action mask (1=valid, 0=invalid)
         action_mask = obs.get("action_mask", None)
-        
-        # print(action_mask)
         if action_mask is not None:
             action_mask = action_mask.to(distribution.distribution.logits.device)
-            # 若整行全 0，避免 -inf 全部變 NaN → fallback 全設為 1
+            # Handle all-zero masks to avoid NaN
             all_zero = (action_mask.sum(dim=1) == 0)
             if all_zero.any():
-                # print(f"[DictTransformerPolicy] Warning: action_mask all zeros for some observations")
                 action_mask[all_zero] = 1.0
 
-            # 將非法行動 logits 大幅降權
+            # Mask invalid actions
             logits = distribution.distribution.logits
             logits = logits + (action_mask - 1) * 1e9
             distribution.distribution.logits = logits
-            # print(f"[DictTransformerPolicy] Logits after masking: {logits}")
 
-        # 取動作
+        # Sample actions
         actions = distribution.get_actions(deterministic=deterministic)
         log_prob = distribution.log_prob(actions)
         values = self.value_net(latent_vf)
         return actions, values, log_prob
+
     def _get_latent(self, features: torch.Tensor):
         """
-        拷貝自 ActorCriticPolicy，unpack MlpExtractor 的 policy/value latent。
+        Adapted from ActorCriticPolicy to unpack MlpExtractor latent vectors.
         """
-        # mlp_extractor 回傳 (latent_pi, latent_vf)
         latent_pi, latent_vf = self.mlp_extractor(features)
-        # 如果不用 SDE，可以回 None
-        latent_sde = None
+        latent_sde = None  # No SDE
         return latent_pi, latent_vf, latent_sde
 
     def _predict(self, observation, deterministic: bool = False):
         """
-        SB3 用來在 rollout 時快速取得動作。
-        確保與 forward 一致（只取動作，不回傳 value/log_prob）。
+        Used by SB3 for rollout. Returns only actions, consistent with forward.
         """
         features = self.extract_features(observation)
         latent_pi, latent_vf, latent_sde = self._get_latent(features)
@@ -110,27 +173,21 @@ class DictTransformerPolicy(ActorCriticPolicy):
 
         return distribution.get_actions(deterministic=deterministic)
 
-def make_env(rank, seed=0):
-    """
-    創建環境的工廠函數
-    
-    Args:
-        rank: 進程編號
-        seed: 隨機種子
-    """
 
+
+def make_env(rank, seed=0, render_mode=None):
     def _init():
-        # 為每個進程設置不同的隨機種子
         try:
-            env = gym.make('ConnectFour-v0')
+            env = gym.make('ConnectFour-v0', render_mode=render_mode)
         except gym.error.NameNotFound:
             register(id='ConnectFour-v0', entry_point='connectFour:ConnectFourEnv')
-
-        env = gym.make('ConnectFour-v0')
+        env = gym.make('ConnectFour-v0', render_mode=render_mode)
         env.reset(seed=seed + rank)
         return env
     set_random_seed(seed)
     return _init
+
+
 
 class EvaluationCallback(BaseCallback):
     def __init__(self, verbose=0, eval_freq=1000, save_freq=5000):
@@ -273,8 +330,10 @@ class EvaluationCallback(BaseCallback):
 
         if mean_reward > self.best_mean_reward:
             self.best_mean_reward = mean_reward
+            import os
+
             model_name = f"ppo_connectfour_best_{mean_reward:.3f}.zip"
-            self.model.save(model_name)
+            self.model.save(os.path.join('checkpoints', model_name))
             send_telegram(f"新最佳模型\nMean(step1000)={mean_reward:.3f} WinRate={win_rate:.3f}")
             print(f"[Saved] {model_name}")
 
@@ -287,7 +346,9 @@ class EvaluationCallback(BaseCallback):
     def _on_training_end(self):
         self._evaluate_and_log()
         final_name = "ppo_connectfour_final.zip"
-        self.model.save(final_name)
+        import os
+
+        self.model.save(os.path.join('checkpoints', final_name))
         total_games = sum(self.game_results.values())
         win_rate = self.game_results['win'] / total_games if total_games else 0
         send_telegram(f"訓練結束 steps={self.num_timesteps} games={total_games} win_rate={win_rate:.3f}")
