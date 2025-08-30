@@ -1,200 +1,195 @@
 import torch
-import gymnasium as gym
-import numpy as np
-import torch.nn as nn
-from gymnasium.envs.registration import register
 from stable_baselines3 import PPO
-from stable_baselines3.common.policies import ActorCriticPolicy
-from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
-from stable_baselines3.common.callbacks import BaseCallback
-from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
-from stable_baselines3.common.utils import set_random_seed
-import time
 
+# Load your trained SB3 model
+model = PPO.load("checkpoints/ppo_connectfour_best_-0.233")
 
-# 自訂 Transformer 特徵提取器
-class DictTransformerExtractor(BaseFeaturesExtractor):
-    def __init__(self, observation_space, features_dim=128, d_model=64, num_layers=14, num_heads=16, mark_emb_dim=8):
-        super().__init__(observation_space, features_dim)
-        board_dim = observation_space.spaces["board"].shape[0]
+# Extract the policy network
+policy = model.policy
+state_dict = policy.state_dict()
+
+# Save the policy weights
+torch.save(state_dict, "policy_weights.pth")
+
+# Optional: Save as base64 for embedding (if file size is small enough)
+import base64
+with open("policy_weights.pth", "rb") as f:
+    weights_data = f.read()
+    weights_b64 = base64.b64encode(weights_data).decode('utf-8')
+    # print(weights_b64)  # Copy this for embedding in submission.py
+
+agent_code = f'''
+import torch
+import torch.nn as nn
+import base64
+import io
+
+# Custom feature extractor (from your training script)
+class DictTransformerExtractor(nn.Module):
+    def __init__(self, features_dim=256, d_model=128, num_layers=42, num_heads=8, mark_emb_dim=8, height=6, width=7, cnn_channels=[126, 126]):
+        super().__init__()
+        self.height = height
+        self.width = width
+        self.seq_len = height * width
         self.d_model = d_model
-        assert d_model % num_heads == 0
+        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
+        
+        # CNN backbone
+        self.cnn_layers = nn.ModuleList()
+        in_channels = 3  # One-hot for 0=empty, 1=player1, 2=player2
+        for out_channels in cnn_channels:
+            self.cnn_layers.append(nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1))
+            self.cnn_layers.append(nn.ReLU())
+            in_channels = out_channels
+        
+        self.cnn_out_dim = cnn_channels[-1]
+        self.cnn_projection = nn.Linear(self.cnn_out_dim, d_model)
+        
+        # Mark embedding
         self.mark_embedding = nn.Embedding(2, mark_emb_dim)
-        self.input_projection = nn.Linear(board_dim + mark_emb_dim, d_model)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=num_heads, dim_feedforward=128, batch_first=True
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.mark_projection = nn.Linear(mark_emb_dim, d_model)
+        
+        # Positional encoding
+        self.pos_encoding = nn.Parameter(torch.randn(1, self.seq_len, d_model) * 0.01)
+        
+        # Transformer with residual blocks
+        self.transformer_blocks = nn.ModuleList()
+        self.norms = nn.ModuleList()
+        for i in range(0, num_layers, 2):
+            layers = []
+            for _ in range(2):
+                layer = nn.TransformerEncoderLayer(
+                    d_model=d_model, nhead=num_heads, dim_feedforward=256,
+                    dropout=0.2, batch_first=True, norm_first=True
+                )
+                layers.append(layer)
+            self.transformer_blocks.append(nn.Sequential(*layers))
+            self.norms.append(nn.LayerNorm(d_model))
+        
+        # Output layer
         self.out = nn.Linear(d_model, features_dim)
 
     def forward(self, observations):
-        board = observations["board"]
-        mark = observations["mark"]
-        mark_idx = (mark.long() - 1).squeeze(-1)
-        mark_emb = self.mark_embedding(mark_idx)
-        x = torch.cat([board, mark_emb], dim=1)
-        x = self.input_projection(x)
-        x = x.unsqueeze(1)
-        x = self.transformer(x).squeeze(1)
-        return self.out(x)
+        board = observations["board"]  # (B, 42)
+        mark = observations["mark"]    # (B, 1)
+        B = board.shape[0]
+        
+        # Reshape and one-hot encode
+        board_int = board.long()
+        board_onehot = torch.zeros(B, 3, self.height, self.width, device=board.device)
+        board_onehot.scatter_(1, board_int.view(B, 1, self.height, self.width), 1)
+        x = board_onehot  # (B, 3, 6, 7)
+        
+        # CNN layers
+        for layer in self.cnn_layers:
+            x = layer(x)
+        
+        # Flatten and project
+        x = x.flatten(2).transpose(1, 2)  # (B, 42, cnn_out_dim)
+        x = self.cnn_projection(x)  # (B, 42, d_model)
+        
+        # Mark embedding
+        mark_idx = (mark.long() - 1).squeeze(-1)  # (B,)
+        mark_emb = self.mark_embedding(mark_idx)  # (B, mark_emb_dim)
+        mark_emb = self.mark_projection(mark_emb).unsqueeze(1)  # (B, 1, d_model)
+        x += mark_emb  # Broadcast: (B, 42, d_model)
+        
+        # Positional encoding
+        x += self.pos_encoding
+        
+        # Transformer blocks with residual and LayerNorm
+        for block, norm in zip(self.transformer_blocks, self.norms):
+            residual = x
+            x = block(x)
+            x = x + residual
+            x = norm(x)
+        
+        # Global mean pooling
+        x = x.mean(dim=1)  # (B, d_model)
+        
+        # Output
+        return self.out(x)  # (B, features_dim)
 
-class DictTransformerPolicy(ActorCriticPolicy):
-    def __init__(self, observation_space, action_space, lr_schedule, **kwargs):
-        super().__init__(
-            observation_space,
-            action_space,
-            lr_schedule,
-            features_extractor_class=DictTransformerExtractor,
-            features_extractor_kwargs=dict(features_dim=128, d_model=64, num_layers=14, num_heads=16),
-            **kwargs
+# Simplified policy network without SB3
+class DictTransformerPolicy(nn.Module):
+    def __init__(self, action_dim=7, features_dim=256):
+        super().__init__()
+        self.features_extractor = DictTransformerExtractor(
+            features_dim=features_dim,
+            d_model=128,
+            num_layers=42,
+            num_heads=8,
+            height=6,
+            width=7,
+            cnn_channels=[126, 126]
+        )
+        # MLP for action logits
+        self.mlp_actor = nn.Sequential(
+            nn.Linear(features_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Linear(128, action_dim)
         )
 
-def make_env(rank, seed=0):
-    """
-    創建環境的工廠函數
-    
-    Args:
-        rank: 進程編號
-        seed: 隨機種子
-    """
+    def forward(self, obs):
+        features = self.features_extractor(obs)
+        logits = self.mlp_actor(features)
+        
+        # Apply action mask
+        action_mask = obs.get("action_mask", None)
+        if action_mask is not None:
+            logits = logits + (action_mask - 1) * 1e9  # Mask invalid actions
+        
+        return logits
 
-    def _init():
-        # 為每個進程設置不同的隨機種子
-        try:
-            env = gym.make('ConnectFour-v0')
-        except gym.error.NameNotFound:
-            register(id='ConnectFour-v0', entry_point='connectFour:ConnectFourEnv')
+# Load model weights (replace with your base64 string or file path)
+MODEL_WEIGHTS = "{weights_b64}"
+# Decode and load weights
+weights_data = base64.b64decode(MODEL_WEIGHTS)
+weights_buffer = io.BytesIO(weights_data)
+state_dict = torch.load(weights_buffer, map_location=torch.device('cpu'))
 
-        env = gym.make('ConnectFour-v0')
-        env.reset(seed=seed + rank)
-        return env
-    set_random_seed(seed)
-    return _init
+# Initialize policy and load weights
+policy = DictTransformerPolicy(action_dim=7, features_dim=256)
+policy.load_state_dict(state_dict)
+policy.eval()  # Set to evaluation mode
 
-# 自訂回調以記錄平均獎勵並保存模型
-class EvaluationCallback(BaseCallback):
-    def __init__(self, verbose=0):
-        super(EvaluationCallback, self).__init__(verbose)
-        self.best_mean_reward = -float('inf')
-        self.rewards = []
+def get_action_mask(board, config):
+    """Generate action mask for valid moves (1 for valid, 0 for invalid)."""
+    board = np.array(board).reshape(config.rows, config.columns)
+    action_mask = np.zeros(config.columns, dtype=np.float32)
+    for col in range(config.columns):
+        if board[0, col] == 0:  # Top row is empty, column is valid
+            action_mask[col] = 1.0
+    return action_mask
 
-    def _on_step(self):
-        self.rewards.extend(self.locals['rewards'])
-        # 每 1000 步檢查一次平均獎勵並保存最佳模型
-        if len(self.rewards) >= 1000:
-            mean_reward = np.mean(self.rewards[-1000:])
-            if mean_reward > self.best_mean_reward:
-                self.best_mean_reward = mean_reward
-                self.model.save(f"ppo_connectfour_reward_{mean_reward:.2f}.pt")
-                print(f"Saved model with mean reward: {mean_reward:.2f}")
-        return True
+def agent(obs, config):
+    """Kaggle ConnectX agent function."""
+    # Convert Kaggle observation to model-compatible format
+    board = np.array(obs.board, dtype=np.int64).reshape(1, -1)  # (1, 42)
+    mark = np.array([obs.mark], dtype=np.int64).reshape(1, 1)  # (1, 1)
+    action_mask = get_action_mask(obs.board, config).reshape(1, -1)  # (1, 7)
 
-    def _on_training_end(self):
-        mean_reward = np.mean(self.rewards)
-        print(f"Average reward: {mean_reward}")
-        if mean_reward > self.best_mean_reward:
-            self.best_mean_reward = mean_reward
-            self.model.save(f"ppo_connectfour_reward_{mean_reward:.2f}.pt")
-            print(f"Saved model with mean reward: {mean_reward:.2f}")
+    # Create observation dictionary
+    observation = {{
+        "board": torch.tensor(board, dtype=torch.int64),
+        "mark": torch.tensor(mark, dtype=torch.int64),
+        "action_mask": torch.tensor(action_mask, dtype=torch.float32)
+    }}
 
+    # Predict action
+    with torch.no_grad():
+        logits = policy(observation)
+        action = torch.argmax(logits, dim=1).item()  # Deterministic action
 
+    # Fallback to random valid action if predicted action is invalid
+    valid_actions = np.where(action_mask[0] == 1)[0]
+    if action_mask[0, action] == 0 and len(valid_actions) > 0:
+        action = np.random.choice(valid_actions)
 
-def send_telegram(msg: str):
-    import os
-    token = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID") or "6166024220"
-    if not token or not chat_id:
-        print("未設置 TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID，略過訊息通知。")
-        return
-    try:
-        import requests
-        base = f"https://api.telegram.org/bot{token}/sendMessage"
-        payload = {"chat_id": chat_id, "text": msg}
-        r = requests.post(base, data=payload, timeout=3.0)
-        print("已發送 Telegram 通知。")
-    except Exception as e:
-        print(f"Telegram 發送失敗: {e}")
+    return int(action)
+'''
 
-
-def visualize_model(model, num_episodes=5):
-    """使用單個環境進行可視化"""
-    env = gym.make('ConnectFour-v0', render_mode='human')
-
-    for ep in range(num_episodes):
-        obs, _ = env.reset()
-        terminated = False
-        truncated = False
-        total_reward = 0.0
-        steps = 0
-        print(f"Visualization Episode {ep+1}")
-        while not (terminated or truncated):
-            action, _ = model.predict(obs, deterministic=True)
-            obs, reward, terminated, truncated, info = env.step(action)
-            total_reward += reward
-            steps += 1
-            env.render()
-            time.sleep(0.5)
-        print(f"Episode {ep+1} reward={total_reward} steps={steps}")
-    env.close()
-
-def main():
-    # 註冊環境
-    register(id='ConnectFour-v0', entry_point='connectFour:ConnectFourEnv')
-    
-    # 設置參數
-    num_cpu = 1  # 使用的 CPU 核心數
-    total_timesteps = 10
-    
-    print(f"使用 {num_cpu} 個並行環境進行訓練")
-    
-    # 創建多進程向量化環境
-    if num_cpu == 1:
-        # 單進程版本（調試用）
-        env = DummyVecEnv([make_env(0)])
-    else:
-        # 多進程版本
-        env = SubprocVecEnv([make_env(i) for i in range(num_cpu)])
-    
-    # 創建模型
-    model = PPO(
-        DictTransformerPolicy,
-        env,
-        verbose=1,
-        n_steps=20 // num_cpu,  # 每個環境的步數
-        batch_size=256,           # 批次大小
-        n_epochs=10,              # 每次更新的 epoch 數
-        learning_rate=3e-4,       # 學習率
-        clip_range=0.2,           # PPO clip 範圍
-        policy_kwargs=dict(net_arch=[128, 128]),
-    )
-    
-    # 創建回調
-    callback = EvaluationCallback()
-    
-    print("開始訓練...")
-    start_time = time.time()
-    
-    # 訓練模型
-    model.learn(
-        total_timesteps=total_timesteps,
-        callback=callback,
-        progress_bar=True
-    )
-    
-    print(f"訓練完成！耗時: {time.time() - start_time:.2f} 秒")
-    
-    # 保存最終模型
-    model.save("ppo_connect4_multiprocessing_final.zip")
-    print("最終模型已保存")
-    
-    # 關閉環境
-    env.close()
-    
-    # 可視化測試（可選）
-    print("開始可視化測試...")
-    visualize_model(model, num_episodes=3)
-    send_telegram('Connect Four 模型訓練完成並已保存！')
-
-
-if __name__ == "__main__":
-    main()
+with open("submission.py", "w") as f:
+    f.write(agent_code)

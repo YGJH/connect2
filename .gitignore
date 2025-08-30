@@ -13,6 +13,7 @@ submission.py
 submission**
 checkpoints/
 *.pkl
-
+*.pth
+*.bin
 # Virtual environments
 .venv

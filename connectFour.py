@@ -34,7 +34,10 @@ class ConnectFourEnv(gym.Env):
             "mark": spaces.Box(low=1, high=2, shape=(1,), dtype=np.float32),
             "action_mask": spaces.Box(low=0, high=1, shape=(self.width,), dtype=np.float32)
         })
-        self.folder_path = 'opponents'
+        self.folder_path = 'checkopponents'
+        if not os.path.exists(self.folder_path):
+            os.makedirs(self.folder_path)
+
         self.opponent_list = [self.load_agent(f) for f in os.listdir(os.path.join(self.folder_path)) if f.endswith('.py')]
         self.opponent_list.append('self')
         self.opponent_names = [getattr(opp, '_source_file', 'unknown') if callable(opp) else 'self_play' for opp in self.opponent_list]
@@ -64,31 +67,33 @@ class ConnectFourEnv(gym.Env):
         self.step_count = 0
         gc.collect()
         # 先決定對手
-        # if self.episode_count < 500000 and False:
-        # self.opponent = 'self'
-        # else:
-        weights = []
-        for name in self.opponent_names:
-            if name == 'self_play':
-                weight = 1.0
-            else:
-                stats = self.opponent_stats[name]
-                games = stats['games']
-                if games == 0:
+        if self.episode_count % 1000 > 100:
+            self.opponent = 'self'
+            idx = self.opponent_list.index(self.opponent)
+        else:
+            weights = []
+            for name in self.opponent_names:
+                if name == 'self_play':
                     weight = 1.0
                 else:
-                    opp_win_rate = stats['opponent_wins'] / games
-                    if games < 10 or opp_win_rate >= 0.7:
+                    stats = self.opponent_stats[name]
+                    games = stats['games']
+                    if games == 0:
                         weight = 1.0
                     else:
-                        weight = 0.1
-            weights.append(weight)
-        total_weight = sum(weights)
-        if total_weight == 0:
-            probabilities = [1.0 / len(weights)] * len(weights)
-        else:
-            probabilities = [w / total_weight for w in weights]
-        idx = np.random.choice(len(self.opponent_list), p=probabilities)
+                        opp_win_rate = stats['opponent_wins'] / games
+                        weight = opp_win_rate * 0.5
+                
+                weights.append(weight)
+        
+        
+            total_weight = sum(weights)
+            if total_weight == 0:
+                probabilities = [1.0 / len(weights)] * len(weights)
+            else:
+                probabilities = [w / total_weight for w in weights]
+            idx = np.random.choice(len(self.opponent_list), p=probabilities)
+        
         self.opponent = self.opponent_list[idx]
         self._opponent_name_cached = self.opponent_names[idx]
         if self.opponent == 'self':
@@ -99,14 +104,10 @@ class ConnectFourEnv(gym.Env):
         else:
             self._opponent_name_cached = str(self.opponent)
        
-        # Remove/comment out this block:
-        # if self.current_player == 1:
-        # # 讓對手落子
-        # obs, reward, terminated, truncated, info = self.step(None)
-        # if terminated or truncated:
-        # # 立即結束 (極少見，但保險)
-        # self.games_count += 1
-        # return obs, {}
+
+        import torch
+        torch.cuda.empty_cache()
+
         self.games_count += 1
         return self._get_obs(), {}
     def _get_info(self):
@@ -129,11 +130,7 @@ class ConnectFourEnv(gym.Env):
         agent = utils.get_last_callable(submission)
         setattr(agent, "_source_file", file_path)
         return agent
-    # def _get_opponent_action(self):
-    # temp = self._get_obs()
-    # temp['board'] = temp['board'].astype(np.int8)
-    # temp['mark'] = temp['mark'].astype(np.int8).tolist()[0]
-    # return self.opponent(temp, self.config)
+
     def _get_opponent_action(self):
         temp = self._get_obs()
         temp['board'] = temp['board'].astype(np.int8).tolist()
@@ -169,13 +166,15 @@ class ConnectFourEnv(gym.Env):
                     # Agent made an illegal move as opponent; treat as win for agent's main role
                     info.update({'game_result': 'win', 'winner': self.agent_piece})
                     self._update_info(info)
-                    return self._get_obs(), 2.0, True, False, info
+                    return self._get_obs(), 0.0, True, False, info
                 row = self._next_open_row(action)
                 self.board[row, action] = self.label
                 # Win/draw check
                 if self._is_winner(self.label):
+                    # reward = 2.0 if self.label == self.agent_piece else -30.0
+
                     # In self-play, reward based on agent's assigned piece
-                    reward = 2.0 if self.label == self.agent_piece else -30.0 + (np.count_nonzero(self.board) / (self.height * self.width)) * 10
+                    reward = 2.0 + (1 - (np.count_nonzero(self.board) / (self.height * self.width))) * 10 if self.label == self.agent_piece else -30.0 + (np.count_nonzero(self.board) / (self.height * self.width)) * 10
                     info.update({'evaluation': reward})
                     info.update({'game_result': 'win' if self.label == self.agent_piece else 'loss', 'winner': self.label})
                     self._update_info(info)
@@ -199,11 +198,13 @@ class ConnectFourEnv(gym.Env):
                     info.update({'evaluation': 0.0})
                     info.update({'game_result': 'win', 'winner': self.agent_piece})
                     self._update_info(info)
-                    return self._get_obs(), 2.0, True, False, info # Changed to +2.0 for consistency
+                    return self._get_obs(), 0.0, True, False, info # Changed to +2.0 for consistency
                 row = self._next_open_row(opp_action)
                 self.board[row, opp_action] = self.label
                 if self._is_winner(self.label):
-                    reward = 2.0 if self.label == self.agent_piece else -30.0 + (np.count_nonzero(self.board) / (self.height * self.width)) * 10
+                    # reward = 2.0 if self.label == self.agent_piece else -30.0
+
+                    reward = 2.0 + (1 - (np.count_nonzero(self.board) / (self.height * self.width))) * 10 if self.label == self.agent_piece else -30.0 + (np.count_nonzero(self.board) / (self.height * self.width)) * 10
                     info.update({'evaluation': reward})
                     info.update({'game_result': 'loss', 'winner': self.label})
                     self._update_info(info)
@@ -230,10 +231,12 @@ class ConnectFourEnv(gym.Env):
         self.board[row, action] = self.label
         if self._is_winner(self.label):
             self.win_count += 1
-            info.update({'evaluation': 2.0})
+            # reward = 2.0 if self.label == self.agent_piece else -30.0
+            reward = 2.0 + (1 - (np.count_nonzero(self.board) / (self.height * self.width))) * 10 if self.label == self.agent_piece else -30.0 + (np.count_nonzero(self.board) / (self.height * self.width)) * 10
+            info.update({'evaluation': reward})
             info.update({'game_result': 'win', 'winner': self.label})
             self._update_info(info)
-            return self._get_obs(), 2.0, True, False, info
+            return self._get_obs(), reward , True, False, info
         if self._is_draw():
             info.update({'evaluation': -0.1})
             info.update({'game_result': 'draw'})
@@ -244,6 +247,23 @@ class ConnectFourEnv(gym.Env):
         self.label = 3 - self.label
         info.update({'evaluation': 0.00})
         return self._get_obs(), 0.00, False, False, info
+
+    def update_opponents(self):
+        """更新opponent_list和相關結構，只添加新發現的.py檔案，而不重置現有統計。"""
+        current_files = {getattr(opp, '_source_file', None) for opp in self.opponent_list if opp != 'self'}
+        all_files = {f for f in os.listdir(self.folder_path) if f.endswith('.py')}
+        new_files = all_files - current_files
+
+        for f in new_files:
+            agent = self.load_agent(f)
+            self.opponent_list.append(agent)
+            name = getattr(agent, '_source_file', 'unknown')
+            self.opponent_names.append(name)
+            if name not in self.opponent_stats:
+                self.opponent_stats[name] = {'games': 0, 'agent_wins': 0, 'opponent_wins': 0, 'draws': 0}
+        print(f'Updated opponent stats: {self.opponent_stats}')
+
+
     def _is_valid_action(self, action):
         if action is None or not isinstance(action, (int, np.integer)) or action < 0 or action >= self.width:
             return False
