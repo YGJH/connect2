@@ -10,10 +10,14 @@ opponent/
 opponents/
 videos/
 submission.py
+checkopponents/
 submission**
 checkpoints/
 *.pkl
 *.pth
+*.build/
+*.dist/
+opponents_copy/
 *.bin
 # Virtual environments
 .venv

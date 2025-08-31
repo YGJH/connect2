@@ -17,7 +17,7 @@ kaggle_obs = {
 config = {'rows': 6, 'columns': 7, 'inarow': 4}
 
 # Load SB3 model
-model = PPO.load("checkpoints/ppo_connectfour_best_-0.233")
+model = PPO.load("checkpoints/ppo_connectfour_best_-100.747")
 sb3_action, _ = model.predict(obs, deterministic=True)
 print(f"SB3 action: {sb3_action}")
 

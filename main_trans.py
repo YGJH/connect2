@@ -487,7 +487,7 @@ def main():
     env.close()
     
     print("開始可視化測試...")
-    visualize_model(model, num_episodes=10)
+    visualize_model(model, num_episodes=5)
 
 if __name__ == '__main__':
     main()

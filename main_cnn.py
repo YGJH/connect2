@@ -16,16 +16,16 @@ import os
 import requests
 import gc
 import gymnasium.spaces as spaces
-
-
-
+from stable_baselines3.common.vec_env import VecNormalize
+import math
+from typing import Callable
 
 def make_env(rank, seed=0, render_mode=None):
     def _init():
         try:
-            register(id='ConnectFour-v0', entry_point='connectFour:ConnectFourEnv')  # Adjust entry_point if needed
             env = gym.make('ConnectFour-v0', render_mode=render_mode)
         except gym.error.NameNotFound:
+            register(id='ConnectFour-v0', entry_point='connectFour:ConnectFourEnv')  # Adjust entry_point if needed
             env = gym.make('ConnectFour-v0', render_mode=render_mode)
         env.reset(seed=seed + rank)
         return env
@@ -51,14 +51,20 @@ class ConnectFourExtractor(BaseFeaturesExtractor):
         super().__init__(observation_space, features_dim)
         self.height = 6
         self.width = 7
-        n_channels = 64
+        n_channels = 256
         self.cnn = nn.Sequential(
             nn.Conv2d(3, n_channels, kernel_size=3, padding=1),
             nn.BatchNorm2d(n_channels),
             nn.ReLU(),
             ResBlock(n_channels),
             ResBlock(n_channels),
-            ResBlock(n_channels),  # Add one more for better capacity
+            ResBlock(n_channels),
+            ResBlock(n_channels),
+            ResBlock(n_channels),
+            ResBlock(n_channels),
+            ResBlock(n_channels),
+
+
             nn.Flatten(),
         )
         # Compute flattened size dynamically
@@ -100,7 +106,7 @@ class CustomAlphaZeroPolicy(ActorCriticPolicy):
             **kwargs,
             features_extractor_class=ConnectFourExtractor,
             features_extractor_kwargs=dict(features_dim=256),
-            net_arch=dict(pi=[128, 128], vf=[128, 128]),
+            net_arch=dict(pi=[128,128, 128], vf=[128,128, 128]),
             activation_fn=nn.ReLU,
         )
 
@@ -112,6 +118,7 @@ class CustomAlphaZeroPolicy(ActorCriticPolicy):
         logits = logits + (1 - action_mask) * -1e9  # Mask invalid actions by setting logits to -inf
         distribution = self.action_dist.proba_distribution(action_logits=logits)
         return distribution
+
 
 class EvaluationCallback(BaseCallback):
     def __init__(self, verbose=0, eval_freq=1000, save_freq=5000):
@@ -174,6 +181,40 @@ class EvaluationCallback(BaseCallback):
             self.last_eval_step = self.num_timesteps
         return True
 
+
+
+    def visualize_model(model, num_episodes=1):
+        env = gym.make('ConnectFour-v0', render_mode='human')
+        try:
+            for ep in range(num_episodes):
+                obs, _ = env.reset()
+                terminated = False
+                truncated = False
+                total_reward = 0.0
+                steps = 0
+                print(f"Visualization Episode {ep+1}")
+                while not (terminated or truncated):
+                    action, _ = model.predict(obs, deterministic=True)
+                    action = int(action.item())
+                    mask = obs["action_mask"]
+                    valid_actions = np.where(mask == 1)[0]
+                    if mask[action] == 0:
+                        if len(valid_actions) > 0:
+                            action = int(np.random.choice(valid_actions))
+                        else:
+                            terminated = True
+                            break
+                    obs, reward, terminated, truncated, info = env.step(action)
+                    total_reward += reward
+                    steps += 1
+                    env.render()
+                    time.sleep(0.5)
+            print(f"Episode {ep+1} reward={total_reward} steps={steps}")
+        finally:
+            env.close()  # 確保無論如何都 close
+            time.sleep(1)  # 給 Pygame quit 時間
+        
+    
     def _evaluate_and_log(self):
         if len(self.rewards) < 100:
             return
@@ -216,32 +257,74 @@ class EvaluationCallback(BaseCallback):
                 log_info += f"\n  - {opponent}: {opp_wr:.3f} ({stats['wins']}/{stats['games']})"
 
         print(log_info)
-        visualize_model(self.model, num_episodes=1)
+        import os
+        # visualize_model(self.model, num_episodes=1)
+        # if os.path.exists('checkopponents'):
+        #     fs = os.listdir('checkopponents')
+        #     if len(fs) > 5:
+        #         import random
+        #         live = random.sample(fs, 5)
+        #         for f in fs:
+        #             if f not in live:
+        #                 print(f'remove {f}')
+        #                 os.remove(os.path.join('checkopponents', f))
 
+        # if mean_reward > self.best_mean_reward:
+        self.best_mean_reward = mean_reward
+        import os
+        model_name = f"ppo_connectfour_best_cnn_{mean_reward:.3f}.zip"
+        self.model.save(os.path.join('checkpoints', model_name))
         if mean_reward > self.best_mean_reward:
-            self.best_mean_reward = mean_reward
-            import os
-
-            model_name = f"ppo_connectfour_best_{mean_reward:.3f}.zip"
-            self.model.save(os.path.join('checkpoints', model_name))
             send_telegram(f"新最佳模型\nMean(step1000)={mean_reward:.3f} WinRate={win_rate:.3f}")
-            print(f"[Saved] {model_name}")
+            self.best_mean_reward = mean_reward
+
+        print(f"\036[32m[Saved] {model_name}\036[0m")
+        cmd = ['uv',
+        'run',
+        'dump_weight_cnn.py',
+        '--model_path',
+        'checkpoints/'+model_name,
+        '--output',
+        f'checkopponents/dump_weight_cnn_{self.episode_count}.py']
+        cmd = ' '.join(cmd)
+        try:
+            import subprocess
+            print(f'cmd {cmd}')
+            subprocess.run(cmd , check=True, shell=True, capture_output=True)
+            # update opponent_list
+            self.training_env.env_method('update_opponents')
+        except Exception as e:
+            print(f"Error occurred while dumping weights: {e}")
+            raise Exception("Weight dumping failed")
+
+        import gc
+        gc.collect()
+        # remove some opponents because it will occupy too much memory
+        # import random
+        # opponents = [f for f in os.listdir('checkopponents') if f.startswith('ppo_connectfour_cnn_')]
+        # if len(opponents) > 5:
+        #     for opponent in opponents:
+        #         if opponent not in self.opponent_stats:
+        #             continue
+        #         if random.random() < 0.5:
+        #             os.remove(os.path.join('checkopponents', opponent))
+        #             del self.opponent_stats[opponent]
 
 
-        # if self.num_timesteps % self.save_freq == 0:
-        #     ckpt = f"ppo_connectfour_checkpoint_{self.num_timesteps}.zip"
-        #     self.model.save(ckpt)
-        #     print(f"[Checkpoint] {ckpt}")
+
+
 
     def _on_training_end(self):
         self._evaluate_and_log()
-        final_name = "ppo_connectfour_final.zip"
+        final_name = "ppo_connectfour_cnn_final.zip"
         import os
 
         self.model.save(os.path.join('checkpoints', final_name))
         total_games = sum(self.game_results.values())
         win_rate = self.game_results['win'] / total_games if total_games else 0
         send_telegram(f"訓練結束 steps={self.num_timesteps} games={total_games} win_rate={win_rate:.3f}")
+
+
 
 def send_telegram(msg: str):
     import os
@@ -302,17 +385,38 @@ def visualize_model(model, num_episodes=5):
         env.close()
         time.sleep(1)
 
+def cosine_annealing_schedule(initial_value: float):
+    """
+    Cosine annealing learning rate schedule.
+
+    :param initial_value: Initial learning rate.
+    :return: schedule that computes
+      current learning rate depending on remaining progress
+    """
+    def func(progress_remaining: float) -> float:
+        """
+        Progress will decrease from 1 (beginning) to 0.
+
+        :param progress_remaining:
+        :return: current learning rate
+        """
+        fraction = 1.0 - progress_remaining
+        return initial_value * 0.5 * (1.0 + math.cos(math.pi * fraction))
+
+    return func
+
 def main():
+    print("\033[1;32m")
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', default=None, help='Path to the output file (optional).')
     parser.add_argument('--total_step', default=1000, type=int, help='total_step to train')
     parser.add_argument('--num_cpu', default=8, type=int, help='cpu cores')
     parser.add_argument('--eval_freq', default=1001, type=int, help='eval_freq')
-    parser.add_argument('--lr', default=1e-4, type=float, help='learning rate')
+    parser.add_argument('--lr', default=3e-4, type=float, help='learning rate')
     parser.add_argument('--n_steps', default=2048, type=int, help='n_steps')
     parser.add_argument('--n_epochs', default=20, type=int, help='n_epochs')
-    parser.add_argument('--ent_coef', default=0.01, type=float, help='ent_coef')
+    parser.add_argument('--ent_coef', default=0.005, type=float, help='ent_coef')
     parser.add_argument('--vf_coef', default=0.5, type=float, help='vf_coef')
     parser.add_argument('--batch_size', default=256, type=int, help='batch_size')
 
@@ -326,7 +430,17 @@ def main():
     ent_coef = float(args.ent_coef)
     vf_coef = float(args.vf_coef)
 
-    register(id='ConnectFour-v0', entry_point='__name__:ConnectFourEnv')  # Adjust if needed
+    register(id='ConnectFour-v0', entry_point='connectFour:ConnectFourEnv')  # Adjust if needed
+    if os.path.exists('checkopponents'):
+        fs = os.listdir('checkopponents')
+        if len(fs) > 5:
+            import random
+            live = random.sample(fs, 5)
+            for f in fs:
+                if f not in live:
+                    print(f'remove {f}')
+                    os.remove(os.path.join('checkopponents', f))
+
 
     print(f"Training with {num_cpu} parallel environments")
 
@@ -335,10 +449,13 @@ def main():
     else:
         env = SubprocVecEnv([make_env(i) for i in range(num_cpu)])
 
+    env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_obs=10.0, clip_reward=50.0)
+
+
     model = PPO(
         CustomAlphaZeroPolicy,
         env,
-        learning_rate=learning_rate,
+        learning_rate=cosine_annealing_schedule(3e-4),
         n_steps=n_steps,
         batch_size=batch_size,
         n_epochs=n_epochs,

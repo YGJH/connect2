@@ -8,6 +8,8 @@ import os
 from kaggle_environments import make, utils
 import pygame
 import math
+import weakref
+
 class ConnectFourEnv(gym.Env):
     metadata = {"render_modes": ["human", "ansi"], "render_fps": 20}
     class Config:
@@ -20,6 +22,8 @@ class ConnectFourEnv(gym.Env):
         self.agent_piece = 1 # Default, will be set in reset
         self.games_count = 0
         self.width = width
+        self.shaping_factor=0.01
+        self.gamma=0.99
         self.height = height
         self.connect = connect
         self.episode_count = 0
@@ -39,6 +43,8 @@ class ConnectFourEnv(gym.Env):
             os.makedirs(self.folder_path)
 
         self.opponent_list = [self.load_agent(f) for f in os.listdir(os.path.join(self.folder_path)) if f.endswith('.py')]
+        # self.opponent_list = random.choices(self.opponent_list ,k=3) if len(self.opponent_list) > 5 else self.opponent_list
+        print(f'Selected opponents: {self.opponent_list}')
         self.opponent_list.append('self')
         self.opponent_names = [getattr(opp, '_source_file', 'unknown') if callable(opp) else 'self_play' for opp in self.opponent_list]
         print(", ".join(self.opponent_names))
@@ -56,6 +62,55 @@ class ConnectFourEnv(gym.Env):
             "mark": np.array([self.label], dtype=np.float32),
             "action_mask": action_mask
         }
+
+    def _compute_heuristic(self, player):
+        """Simple heuristic: Count weighted open lines (threats) for player."""
+        opp = 3 - player
+        score = 0
+        rows, cols = self.height, self.width
+        
+        # Weights: open 2-in-row (+1), open 3-in-row (+10)
+        for n, weight in [(2, 1), (3, 10)]:
+            # Horizontal
+            for r in range(rows):
+                for c in range(cols - n + 1):
+                    window = self.board[r, c:c+n]
+                    if np.all(window == player) and (c > 0 and self.board[r, c-1] == 0 or c == 0) and (c + n < cols and self.board[r, c+n] == 0 or c + n == cols):
+                        score += weight
+            
+            # Vertical (gravity makes open below rare, but check)
+            for c in range(cols):
+                for r in range(rows - n + 1):
+                    window = self.board[r:r+n, c]
+                    if np.all(window == player) and (r > 0 and self.board[r-1, c] == 0 or r == 0) and (r + n < rows and self.board[r+n, c] == 0 or r + n == rows):
+                        score += weight
+            
+            # Diagonal /
+            for r in range(rows - n + 1):
+                for c in range(cols - n + 1):
+                    window = [self.board[r+i, c+i] for i in range(n)]
+                    if all(v == player for v in window) and ((r > 0 and c > 0 and self.board[r-1, c-1] == 0) or (r == 0 or c == 0)) and ((r + n < rows and c + n < cols and self.board[r+n, c+n] == 0) or (r + n == rows or c + n == cols)):
+                        score += weight
+            
+            # Diagonal \
+            for r in range(rows - n + 1):
+                for c in range(n - 1, cols):
+                    window = [self.board[r+i, c-i] for i in range(n)]
+                    if all(v == player for v in window) and ((r > 0 and c < cols-1 and self.board[r-1, c+1] == 0) or (r == 0 or c == cols-1)) and ((r + n < rows and c - n >= 0 and self.board[r+n, c-n] == 0) or (r + n == rows or c - n < 0)):
+                        score += weight
+        
+        return score
+
+    def _get_reward(self, board, winner, agent_piece):
+        filled_ratio = np.count_nonzero(board) / (self.height * self.width)
+        base_win = 1.0
+        base_loss = -1.0
+        length_bonus = 0.5  # Tune: higher encourages efficiency more
+        
+        if winner == agent_piece:
+            return base_win + (1 - filled_ratio) * length_bonus  # +1 to +1.5 (quick win higher)
+        else:
+            return base_loss + filled_ratio * length_bonus  # -1 to -0.5 (slow loss less bad)
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         self.board.fill(0)
@@ -66,36 +121,35 @@ class ConnectFourEnv(gym.Env):
         self.label = 1 # Add this line
         self.step_count = 0
         gc.collect()
-        # 先決定對手
-        if self.episode_count % 1000 > 100:
-            self.opponent = 'self'
-            idx = self.opponent_list.index(self.opponent)
-        else:
-            weights = []
-            for name in self.opponent_names:
-                if name == 'self_play':
+
+
+        self.prev_heuristic = self._compute_heuristic(self.agent_piece) - self._compute_heuristic(3 - self.agent_piece)
+        weights = []
+        for name in self.opponent_names:
+            if name == 'self_play':
+                weight = 1.0
+            else:
+                stats = self.opponent_stats[name]
+                games = stats['games']
+                if games == 0:
                     weight = 1.0
                 else:
-                    stats = self.opponent_stats[name]
-                    games = stats['games']
-                    if games == 0:
-                        weight = 1.0
-                    else:
-                        opp_win_rate = stats['opponent_wins'] / games
-                        weight = opp_win_rate * 0.5
-                
-                weights.append(weight)
-        
-        
-            total_weight = sum(weights)
-            if total_weight == 0:
-                probabilities = [1.0 / len(weights)] * len(weights)
-            else:
-                probabilities = [w / total_weight for w in weights]
-            idx = np.random.choice(len(self.opponent_list), p=probabilities)
+                    opp_win_rate = stats['opponent_wins'] / games
+                    weight = opp_win_rate * 0.3
+            
+            weights.append(weight)
+    
+    
+        total_weight = sum(weights)
+        if total_weight == 0:
+            probabilities = [1.0 / len(weights)] * len(weights)
+        else:
+            probabilities = [w / total_weight for w in weights]
+        idx = np.random.choice(len(self.opponent_list), p=probabilities)
         
         self.opponent = self.opponent_list[idx]
         self._opponent_name_cached = self.opponent_names[idx]
+        # print(self._opponent_name_cached in self.opponent_names)
         if self.opponent == 'self':
             self._opponent_name_cached = 'self_play'
         elif callable(self.opponent):
@@ -146,6 +200,9 @@ class ConnectFourEnv(gym.Env):
     def _update_info(self, info):
         if info['game_result'] != 'ongoing':
             opponent_name = self._opponent_name_cached
+
+        if opponent_name not in self.opponent_stats:
+            opponent_name = 'self_play'
         self.opponent_stats[opponent_name]['games'] += 1
         if info['game_result'] == 'win' and info['winner'] == self.agent_piece:
             self.opponent_stats[opponent_name]['agent_wins'] += 1
@@ -156,6 +213,14 @@ class ConnectFourEnv(gym.Env):
 
     def step(self, action):
         self.step_count = getattr(self, 'step_count', 0) + 1
+        
+        # Compute shaping reward component (potential-based)
+        def get_shaping_reward():
+            new_heuristic = self._compute_heuristic(self.agent_piece) - self._compute_heuristic(3 - self.agent_piece)
+            shaping = self.gamma * new_heuristic - self.prev_heuristic
+            self.prev_heuristic = new_heuristic  # Update for next step
+            return self.shaping_factor * shaping  # Small scale to guide without dominating
+        
         # Opponent's turn (current_player == 1) or no action provided
         if self.current_player == 1 or action is None:
             info = self._get_info()
@@ -163,7 +228,6 @@ class ConnectFourEnv(gym.Env):
                 # Self-play: Agent plays as opponent (but with its own policy)
                 if not self._is_valid_action(action):
                     info.update({'evaluation': 0.0})
-                    # Agent made an illegal move as opponent; treat as win for agent's main role
                     info.update({'game_result': 'win', 'winner': self.agent_piece})
                     self._update_info(info)
                     return self._get_obs(), 0.0, True, False, info
@@ -171,26 +235,22 @@ class ConnectFourEnv(gym.Env):
                 self.board[row, action] = self.label
                 # Win/draw check
                 if self._is_winner(self.label):
-                    # reward = 2.0 if self.label == self.agent_piece else -30.0
-
-                    # In self-play, reward based on agent's assigned piece
-                    reward = 2.0 + (1 - (np.count_nonzero(self.board) / (self.height * self.width))) * 10 if self.label == self.agent_piece else -30.0 + (np.count_nonzero(self.board) / (self.height * self.width)) * 10
+                    reward = self._get_reward(self.board, self.label, self.agent_piece)
                     info.update({'evaluation': reward})
                     info.update({'game_result': 'win' if self.label == self.agent_piece else 'loss', 'winner': self.label})
                     self._update_info(info)
-                    
                     return self._get_obs(), reward, True, False, info
                 if self._is_draw():
                     info.update({'game_result': 'draw'})
-                    info.update({'evaluation': -0.1})
+                    info.update({'evaluation': -0.05})  # Slight negative for draw
                     self._update_info(info)
-                    
-                    return self._get_obs(), -0.1, True, False, info
+                    return self._get_obs(), -0.05, True, False, info
                 # Switch to agent's main role
                 self.current_player = 3 - self.current_player
                 self.label = 3 - self.label
-                info.update({'evaluation': 0.0})
-                return self._get_obs(), 0.0, False, False, info
+                shaping_r = get_shaping_reward()
+                info.update({'evaluation': shaping_r})
+                return self._get_obs(), shaping_r, False, False, info
             else:
                 # External opponent
                 opp_action = self._get_opponent_action()
@@ -198,72 +258,103 @@ class ConnectFourEnv(gym.Env):
                     info.update({'evaluation': 0.0})
                     info.update({'game_result': 'win', 'winner': self.agent_piece})
                     self._update_info(info)
-                    return self._get_obs(), 0.0, True, False, info # Changed to +2.0 for consistency
+                    return self._get_obs(), 0.0, True, False, info
                 row = self._next_open_row(opp_action)
                 self.board[row, opp_action] = self.label
                 if self._is_winner(self.label):
-                    # reward = 2.0 if self.label == self.agent_piece else -30.0
-
-                    reward = 2.0 + (1 - (np.count_nonzero(self.board) / (self.height * self.width))) * 10 if self.label == self.agent_piece else -30.0 + (np.count_nonzero(self.board) / (self.height * self.width)) * 10
+                    reward = self._get_reward(self.board, self.label, self.agent_piece)
                     info.update({'evaluation': reward})
                     info.update({'game_result': 'loss', 'winner': self.label})
                     self._update_info(info)
                     return self._get_obs(), reward, True, False, info
                 if self._is_draw():
-                    info.update({'evaluation': -0.1})
+                    info.update({'evaluation': -0.05})
                     info.update({'game_result': 'draw'})
                     self._update_info(info)
-                    return self._get_obs(), -0.1, True, False, info
+                    return self._get_obs(), -0.05, True, False, info
                 # Switch to agent's turn
                 self.current_player = 2
-                self.label = self.agent_piece # Ensure agent's turn uses its assigned piece
-                info.update({'evaluation': 0.0})
-                return self._get_obs(), 0.0, False, False, info
+                self.label = self.agent_piece
+                shaping_r = get_shaping_reward()
+                info.update({'evaluation': shaping_r})
+                return self._get_obs(), shaping_r, False, False, info
 
         # Agent's turn (current_player == 2)
         info = self._get_info()
         if not self._is_valid_action(action):
             info.update({'game_result': 'loss', 'winner': 3 - self.agent_piece})
-            info.update({'evaluation': -10000.0})
+            info.update({'evaluation': -2.0})  # Moderate penalty for invalid
             self._update_info(info)
-            return self._get_obs(), -10000.0, True, False, info
+            return self._get_obs(), -2.0, True, False, info
         row = self._next_open_row(action)
         self.board[row, action] = self.label
         if self._is_winner(self.label):
             self.win_count += 1
-            # reward = 2.0 if self.label == self.agent_piece else -30.0
-            reward = 2.0 + (1 - (np.count_nonzero(self.board) / (self.height * self.width))) * 10 if self.label == self.agent_piece else -30.0 + (np.count_nonzero(self.board) / (self.height * self.width)) * 10
+            reward = self._get_reward(self.board, self.label, self.agent_piece)
             info.update({'evaluation': reward})
             info.update({'game_result': 'win', 'winner': self.label})
             self._update_info(info)
-            return self._get_obs(), reward , True, False, info
+            return self._get_obs(), reward, True, False, info
         if self._is_draw():
-            info.update({'evaluation': -0.1})
+            info.update({'evaluation': -0.05})
             info.update({'game_result': 'draw'})
             self._update_info(info)
-            return self._get_obs(), -0.1, True, False, info
+            return self._get_obs(), -0.05, True, False, info
         # Switch to opponent's turn
         self.current_player = 3 - self.current_player
         self.label = 3 - self.label
-        info.update({'evaluation': 0.00})
-        return self._get_obs(), 0.00, False, False, info
+        shaping_r = get_shaping_reward()
+        info.update({'evaluation': shaping_r})
+        return self._get_obs(), shaping_r, False, False, info
+
 
     def update_opponents(self):
-        """更新opponent_list和相關結構，只添加新發現的.py檔案，而不重置現有統計。"""
-        current_files = {getattr(opp, '_source_file', None) for opp in self.opponent_list if opp != 'self'}
-        all_files = {f for f in os.listdir(self.folder_path) if f.endswith('.py')}
-        new_files = all_files - current_files
+        # 強制清理舊的 opponent_list 和相關引用
+        old_opponents = self.opponent_list.copy()  # 複製一份以便清理
+        self.opponent_list.clear()  # 清空 set
+        self.opponent_names.clear()
+        self.opponent_stats.clear()
+        
+        # 刪除舊 agent 的強引用（如果有）
+        for opp in old_opponents:
+            if hasattr(opp, '_source_file'):
+                del opp  # 嘗試刪除引用
+        del old_opponents
+        gc.collect()  # 強制垃圾回收
 
-        for f in new_files:
-            agent = self.load_agent(f)
-            self.opponent_list.append(agent)
-            name = getattr(agent, '_source_file', 'unknown')
-            self.opponent_names.append(name)
-            if name not in self.opponent_stats:
+        # 重新初始化
+        self.opponent_list.append('self')
+        self.opponent_names.append('self_play')
+        self.opponent_stats['self_play'] = {'games': 0, 'agent_wins': 0, 'opponent_wins': 0, 'draws': 0}
+
+        # 使用字典追蹤已載入的 agent，避免重複
+        loaded_agents = {}  # key: file_path, value: weakref to agent
+        files = [f for f in os.listdir(self.folder_path) if f.endswith('.py')]
+    
+        
+        # 限制載入數量（e.g., 最多 5 個外部 agent）
+        max_opponents = 5
+        selected_files = random.sample(files, max_opponents)  # 簡單取前 5 個，或用 random.sample 如果需要隨機
+
+        for f in selected_files:
+            file_path = os.path.join(self.folder_path, f)
+            if f in loaded_agents:
+                # 如果已載入，直接使用弱引用
+                agent_ref = loaded_agents[f]
+                agent = agent_ref() if agent_ref() is not None else None
+            else:
+                agent = self.load_agent(f)
+                if agent:
+                    loaded_agents[f] = weakref.ref(agent)  # 弱引用，避免強引用
+            
+            if agent:
+                self.opponent_list.append(agent)
+                name = getattr(agent, '_source_file', f'unknown_{f}')
+                self.opponent_names.append(name)
                 self.opponent_stats[name] = {'games': 0, 'agent_wins': 0, 'opponent_wins': 0, 'draws': 0}
-        print(f'Updated opponent stats: {self.opponent_stats}')
 
-
+        # print(f'Updated opponent stats: {self.opponent_names} opponents loaded')
+        gc.collect()  # 再次清理
     def _is_valid_action(self, action):
         if action is None or not isinstance(action, (int, np.integer)) or action < 0 or action >= self.width:
             return False
