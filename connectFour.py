@@ -46,7 +46,6 @@ class ConnectFourEnv(gym.Env):
         self.observation_space = spaces.Dict({
             "board": spaces.Box(low=0, high=2, shape=(self.height * self.width,), dtype=np.float32),
             "mark": spaces.Box(low=1, high=2, shape=(1,), dtype=np.float32),
-            "action_mask": spaces.Box(low=0, high=1, shape=(self.width,), dtype=np.float32),
         })
         if not os.path.exists(self.folder_path):
             os.makedirs(self.folder_path)
@@ -71,17 +70,12 @@ class ConnectFourEnv(gym.Env):
         self.action_space = spaces.Discrete(self.width)
         self.config = ConnectFourEnv.Config()
     def _get_obs(self):
-        action_mask = np.zeros(self.width, dtype=np.float32)
-        for col in range(self.width):
-            if self._is_valid_action(col):
-                action_mask[col] = 1.0
 
         mark = np.array([self.agent_piece], dtype=np.float32)
 
         return {
             "board": self.board.flatten(),
             "mark": mark,
-            "action_mask": action_mask,
         }
             
 
@@ -123,15 +117,10 @@ class ConnectFourEnv(gym.Env):
 
     def _get_flipped_obs_for_opponent(self):
         # Flip board: swap 1 and 2
-        action_mask = np.zeros(self.width, dtype=np.float32)
-        for col in range(self.width):
-            if self.board[0, col] == 0:
-                action_mask[col] = 1.0
         opp_piece = 3 - self.agent_piece
         return {
             "board": self.board.flatten(),
             "mark": np.array([opp_piece], dtype=np.float32),
-            "action_mask": action_mask
         }
 
 
@@ -214,10 +203,12 @@ class ConnectFourEnv(gym.Env):
         try:
             action = self.opponent(temp, self.config)
         except Exception as e:
-            print(f"[get_opponent_action] Opponent error: {e}, falling back to random action")
-            valid_actions = np.where(temp['action_mask'] == 1)[0]
+            print(f"\033[31m[get_opponent_action] Opponent error: {e}, falling back to random action\033[0m")
+            valid_actions = np.where(temp['board'].reshape(6, 7)[0,:] == 0 , 1 ,0)
             action = np.random.choice(valid_actions) if len(valid_actions) > 0 else 0
         return action           
+
+        
     def _update_info(self, info):
         opponent_name = self._opponent_name_cached
         if opponent_name not in self.opponent_stats:
@@ -232,13 +223,6 @@ class ConnectFourEnv(gym.Env):
                 self.opponent_stats[opponent_name]['opponent_wins'] += 1
             if info['game_result'] == 'draw':
                 self.opponent_stats[opponent_name]['draws'] += 1
-    def kaggle_to_gym_obs(obs, config):
-        board = np.array(obs['board'], dtype=np.float32)
-        mark = np.array([obs['mark']], dtype=np.float32)
-        return {
-            'board': board,
-            'mark': mark,
-        }
 
     def _get_defense_reward(self, row, col, player):
         """

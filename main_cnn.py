@@ -56,11 +56,11 @@ class ResBlock(nn.Module):
         return F.relu(x)
 
 class ConnectFourExtractor(BaseFeaturesExtractor):
-    def __init__(self, observation_space: gym.spaces.Dict, features_dim: int = 64):
+    def __init__(self, observation_space: gym.spaces.Dict, features_dim: int = 256):
         super().__init__(observation_space, features_dim)
         self.height = 6
         self.width = 7
-        n_channels = 64
+        n_channels = 256
         self.cnn = nn.Sequential(
             nn.Conv2d(3, n_channels, kernel_size=3, padding=1),
             nn.BatchNorm2d(n_channels),
@@ -72,6 +72,13 @@ class ConnectFourExtractor(BaseFeaturesExtractor):
             ResBlock(n_channels),
             ResBlock(n_channels),
             ResBlock(n_channels),
+            ResBlock(n_channels),
+            ResBlock(n_channels),
+            ResBlock(n_channels),
+            ResBlock(n_channels),
+            ResBlock(n_channels),
+            ResBlock(n_channels),
+
             nn.Flatten(),
         )
         # Compute flattened size dynamically
@@ -117,8 +124,8 @@ class CustomAlphaZeroPolicy(MaskableActorCriticPolicy):
             *args,
             **kwargs,
             features_extractor_class=ConnectFourExtractor,
-            features_extractor_kwargs=dict(features_dim=64),
-            net_arch=dict(pi=[64, 64, 64], vf=[64, 64, 64]),
+            features_extractor_kwargs=dict(features_dim=256),
+            net_arch=dict(pi=[256, 128, 64, 42], vf=[256, 128, 64, 42]),
             activation_fn=nn.ReLU,
         )
 
@@ -127,8 +134,6 @@ class CustomAlphaZeroPolicy(MaskableActorCriticPolicy):
         features = super().extract_features(obs)
         latent_pi = self.mlp_extractor.forward_actor(features)
         logits = self.action_net(latent_pi)
-
-
         distribution = self.action_dist.proba_distribution(action_logits=logits)
         return distribution
 
@@ -359,7 +364,8 @@ class EvaluationCallback(BaseCallback):
         if mean_reward > self.best_mean_reward:
             send_telegram(f"新最佳模型\nMean(step1000)={mean_reward:.3f} WinRate={win_rate:.3f}")
             self.best_mean_reward = mean_reward
-            
+            print(f"\033[32m[Saved] {os.path.join('checkpoints', model_name)}\033[0m")
+
             # Log model artifact to wandb
             if wandb.run is not None:
                 artifact = wandb.Artifact(f"best_model_{self.num_timesteps}", type="model")
@@ -367,8 +373,7 @@ class EvaluationCallback(BaseCallback):
                 wandb.log_artifact(artifact)
         
         
-        if self.eval_count > 49 and self.visualize_model is not None:
-            print(f"[Saved] {os.path.join('checkpoints', model_name)}")
+        if self.eval_count > 20 and self.visualize_model is not None:
             most_saved_path = f'ppo_connectfour_best_cnn_{mean_reward:.3f}.py'
             cmd = [
                 # 'uv run dump_weight_cnn.py',
@@ -416,8 +421,6 @@ class EvaluationCallback(BaseCallback):
             except Exception as e:
                 print(f"Error occurred while dumping weights: {e}")
                 raise Exception("Weight dumping failed")
-
-
 
             self.visualize_model(self.model, num_episodes=1)
             self.eval_count = 0
@@ -480,14 +483,12 @@ def visualize_model(model, num_episodes=5):
 
                 action, _ = model.predict(obs, deterministic=True)  # Pass the full dict obs here
                 action = int(action.item())
-                mask = obs["action_mask"]
-                valid_actions = np.where(mask == 1)[0]
-                if mask[action] == 0:
+                valid_actions = np.where(obs['board'].reshape(6, 7)[0,:] == 0, 1, 0)[0]
+                if valid_actions[action] == 0:
                     if len(valid_actions) > 0:
-                        action = int(np.random.choice(valid_actions))
-                        print(f"[visualize_model] Invalid action {action} predicted, using random valid action={action}")
+                        print(f"\033[31m[visualize_model]agent Invalid action {action} predicted, using random valid action={action}\033[0m")
                     else:
-                        print("[visualize_model] No valid actions, terminating")
+                        print("\033[31m[visualize_model] opponent No valid actions, terminating\033[0m")
                         terminated = True
                         break
                 obs, reward, terminated, truncated, info = env.step(action)
@@ -614,14 +615,14 @@ def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', default=None, help='Path to the output file (optional).')
-    parser.add_argument('--total_step', default=1000000, type=int, help='total_step to train')
+    parser.add_argument('--total_step', default=3000000, type=int, help='total_step to train')
     parser.add_argument('--num_cpu', default=5, type=int, help='cpu cores')
     parser.add_argument('--eval_freq', default=1001, type=int, help='eval_freq')
     parser.add_argument('--lr', default=1e-4, type=float, help='learning rate')
-    parser.add_argument('--n_steps', default=1000, type=int, help='n_steps')
+    parser.add_argument('--n_steps', default=2048, type=int, help='n_steps')
     parser.add_argument('--n_epochs', default=20, type=int, help='n_epochs')
-    parser.add_argument('--ent_coef', default=0.05, type=float, help='ent_coef')
-    parser.add_argument('--vf_coef', default=1.0, type=float, help='vf_coef')
+    parser.add_argument('--ent_coef', default=0.08, type=float, help='ent_coef')
+    parser.add_argument('--vf_coef', default=0.8, type=float, help='vf_coef')
     parser.add_argument('--batch_size', default=256, type=int, help='batch_size')
     parser.add_argument('--end_coef', default=0.01, type=float, help='end_coef')
     # 新增 wandb 相關參數

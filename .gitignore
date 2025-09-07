@@ -15,6 +15,9 @@ checkopponents/
 submission**
 checkpoints/
 scatter/
+wandb/
+models/
+
 *.pkl
 *.pth
 *.build/

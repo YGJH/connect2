@@ -10,6 +10,7 @@ from gymnasium import spaces
 from sb3_contrib import MaskablePPO
 
 
+n_flatten_global = None  # 全局變數，用於存儲展平後的特徵數量
 # 定義 standalone PyTorch 模型（基於你提供的 ConnectFourExtractor 和 policy 結構）
 class ResBlock(nn.Module):
     def __init__(self, channels):
@@ -27,11 +28,11 @@ class ResBlock(nn.Module):
         return F.relu(x)
 
 class ConnectFourExtractor(nn.Module):
-    def __init__(self, features_dim: int = 64):
+    def __init__(self, features_dim: int = 256):
         super().__init__()
         self.height = 6
         self.width = 7
-        n_channels = 64
+        n_channels = 256
         self.cnn = nn.Sequential(
             nn.Conv2d(3, n_channels, kernel_size=3, padding=1),
             nn.BatchNorm2d(n_channels),
@@ -43,7 +44,12 @@ class ConnectFourExtractor(nn.Module):
             ResBlock(n_channels),
             ResBlock(n_channels),
             ResBlock(n_channels),
-
+            ResBlock(n_channels),
+            ResBlock(n_channels),
+            ResBlock(n_channels),
+            ResBlock(n_channels),
+            ResBlock(n_channels),
+            ResBlock(n_channels),
             nn.Flatten(),
         )
         # from gymnasium import spaces
@@ -56,7 +62,8 @@ class ConnectFourExtractor(nn.Module):
             }
             sample_tensor = self._prepare_sample(sample_obs)
             n_flatten = self.cnn(sample_tensor).shape[1]
-            print(f'n_flatten: {n_flatten}')
+            global n_flatten_global
+            n_flatten_global = n_flatten  # 設置全局變數
         self.linear = nn.Sequential(
             nn.Linear(n_flatten, features_dim),
             nn.ReLU(),
@@ -71,7 +78,7 @@ class ConnectFourExtractor(nn.Module):
         opponent_plane = (board == opponent_mark).float()
         turn_plane = (mark - 1.0).expand_as(board)
         
-        stacked = torch.stack([player_plane, opponent_plane, turn_plane], dim=0)  # (3, 6, 7)
+        stacked = torch.stack([player_plane, opponent_plane, turn_plane], dim=0)  # (5, 6, 7)
         return stacked.unsqueeze(0)  # (1, 5, 6, 7)
     def forward(self, observations):
         board = observations['board'].reshape(-1, self.height, self.width)
@@ -90,16 +97,18 @@ class ConnectFourExtractor(nn.Module):
 class ConnectFourPolicy(nn.Module):
     def __init__(self):
         super().__init__()
-        self.features_extractor = ConnectFourExtractor(features_dim=64)
+        self.features_extractor = ConnectFourExtractor(features_dim=256)
         self.pi_net = nn.Sequential(
-            nn.Linear(64, 64),
+            nn.Linear(256, 256),
             nn.ReLU(),
-            nn.Linear(64, 64),
+            nn.Linear(256, 128),
             nn.ReLU(),
-            nn.Linear(64, 64),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 42),
             nn.ReLU(),
         )
-        self.action_net = nn.Linear(64, 7)  # 輸出 7 個動作的 logits
+        self.action_net = nn.Linear(42, 7)  # 輸出 7 個動作的 logits
 
     def _is_winner(self, board, player):
         b = board
@@ -126,6 +135,8 @@ class ConnectFourPolicy(nn.Module):
         features = self.features_extractor(obs)
         latent_pi = self.pi_net(features)
         logits = self.action_net(latent_pi)
+        action_mask = obs["action_mask"]
+        logits = logits + (1 - action_mask) * -1e8  # Mask 無效動作
         return logits
 
 
@@ -188,11 +199,11 @@ class ResBlock(nn.Module):
         return F.relu(x)
 
 class ConnectFourExtractor(nn.Module):
-    def __init__(self, features_dim: int = 64):
+    def __init__(self, features_dim: int = 256):
         super().__init__()
         self.height = 6
         self.width = 7
-        n_channels = 64
+        n_channels = 256
         self.cnn = nn.Sequential(
             nn.Conv2d(3, n_channels, kernel_size=3, padding=1),
             nn.BatchNorm2d(n_channels),
@@ -204,11 +215,16 @@ class ConnectFourExtractor(nn.Module):
             ResBlock(n_channels),
             ResBlock(n_channels),
             ResBlock(n_channels),
-
+            ResBlock(n_channels),
+            ResBlock(n_channels),
+            ResBlock(n_channels),
+            ResBlock(n_channels),
+            ResBlock(n_channels),
+            ResBlock(n_channels),
             nn.Flatten(),
         )
         self.linear = nn.Sequential(
-            nn.Linear(2688, features_dim),
+            nn.Linear({n_flatten_global}, features_dim),
             nn.ReLU(),
         )
     def forward(self, observations):
@@ -227,22 +243,26 @@ class ConnectFourExtractor(nn.Module):
 class ConnectFourPolicy(nn.Module):
     def __init__(self):
         super().__init__()
-        self.features_extractor = ConnectFourExtractor(features_dim=64)
+        self.features_extractor = ConnectFourExtractor(features_dim=256)
         self.pi_net = nn.Sequential(
-            nn.Linear(64, 64),
+            nn.Linear(256, 256),
             nn.ReLU(),
-            nn.Linear(64, 64),
+            nn.Linear(256, 128),
             nn.ReLU(),
-            nn.Linear(64, 64),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 42),
             nn.ReLU(),
         )
-        self.action_net = nn.Linear(64, 7)  # 輸出 7 個動作的 logits
+        self.action_net = nn.Linear(42, 7)  # 輸出 7 個動作的 logits
 
 
     def forward(self, obs):
         features = self.features_extractor(obs)
         latent_pi = self.pi_net(features)
         logits = self.action_net(latent_pi)
+        action_mask = obs["action_mask"]
+        logits = logits + (1 - action_mask) * -1e8  # Mask 無效動作
         return logits
 
 # 嵌入的 base64 權重（從步驟 2 複製過來）
@@ -291,8 +311,6 @@ def agent(observation, configuration):
     mark_scalar = int(mark[0, 0])
 
 
-
-
     # action mask
     action_mask = np.zeros(7, dtype=np.float32)
     for col in range(7):
@@ -305,6 +323,7 @@ def agent(observation, configuration):
     obs = {{
         "board": torch.from_numpy(board.flatten().astype(np.float32)).unsqueeze(0),        # (1,42)
         "mark": torch.from_numpy(mark.astype(np.float32)),                                # (1,1)
+        "action_mask": torch.from_numpy(action_mask.astype(np.float32)).unsqueeze(0),     # (1,7)
     }}
 
     with torch.no_grad():

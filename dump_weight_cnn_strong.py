@@ -9,6 +9,8 @@ from stable_baselines3.common.policies import ActorCriticPolicy  # 如果需要
 from gymnasium import spaces
 from sb3_contrib import MaskablePPO
 
+
+n_flatten_global = None  # 全局變數，用於存儲展平後的特徵數量
 # 定義 standalone PyTorch 模型（基於你提供的 ConnectFourExtractor 和 policy 結構）
 class ResBlock(nn.Module):
     def __init__(self, channels):
@@ -26,15 +28,21 @@ class ResBlock(nn.Module):
         return F.relu(x)
 
 class ConnectFourExtractor(nn.Module):
-    def __init__(self, features_dim: int = 64):
+    def __init__(self, features_dim: int = 256):
         super().__init__()
         self.height = 6
         self.width = 7
-        n_channels = 64
+        n_channels = 256
         self.cnn = nn.Sequential(
             nn.Conv2d(3, n_channels, kernel_size=3, padding=1),
             nn.BatchNorm2d(n_channels),
             nn.ReLU(),
+            ResBlock(n_channels),
+            ResBlock(n_channels),
+            ResBlock(n_channels),
+            ResBlock(n_channels),
+            ResBlock(n_channels),
+            ResBlock(n_channels),
             ResBlock(n_channels),
             ResBlock(n_channels),
             ResBlock(n_channels),
@@ -52,10 +60,11 @@ class ConnectFourExtractor(nn.Module):
             sample_obs = {
                 "board": np.zeros((self.height * self.width,), dtype=np.float32),
                 "mark": [0],
-                "action_mask": np.ones((self.width,), dtype=np.float32),
             }
             sample_tensor = self._prepare_sample(sample_obs)
             n_flatten = self.cnn(sample_tensor).shape[1]
+            global n_flatten_global
+            n_flatten_global = n_flatten  # 設置全局變數
         self.linear = nn.Sequential(
             nn.Linear(n_flatten, features_dim),
             nn.ReLU(),
@@ -89,16 +98,18 @@ class ConnectFourExtractor(nn.Module):
 class ConnectFourPolicy(nn.Module):
     def __init__(self):
         super().__init__()
-        self.features_extractor = ConnectFourExtractor(features_dim=64)
+        self.features_extractor = ConnectFourExtractor(features_dim=256)
         self.pi_net = nn.Sequential(
-            nn.Linear(64, 64),
+            nn.Linear(256, 256),
             nn.ReLU(),
-            nn.Linear(64, 64),
+            nn.Linear(256, 128),
             nn.ReLU(),
-            nn.Linear(64, 64),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 42),
             nn.ReLU(),
         )
-        self.action_net = nn.Linear(64, 7)  # 輸出 7 個動作的 logits
+        self.action_net = nn.Linear(42, 7)  # 輸出 7 個動作的 logits
 
     def _is_winner(self, board, player):
         b = board
@@ -189,11 +200,11 @@ class ResBlock(nn.Module):
         return F.relu(x)
 
 class ConnectFourExtractor(nn.Module):
-    def __init__(self, features_dim: int = 64):
+    def __init__(self, features_dim: int = 256):
         super().__init__()
         self.height = 6
         self.width = 7
-        n_channels = 64
+        n_channels = 256
         self.cnn = nn.Sequential(
             nn.Conv2d(3, n_channels, kernel_size=3, padding=1),
             nn.BatchNorm2d(n_channels),
@@ -205,11 +216,17 @@ class ConnectFourExtractor(nn.Module):
             ResBlock(n_channels),
             ResBlock(n_channels),
             ResBlock(n_channels),
+            ResBlock(n_channels),
+            ResBlock(n_channels),
+            ResBlock(n_channels),
+            ResBlock(n_channels),
+            ResBlock(n_channels),
+            ResBlock(n_channels),
 
             nn.Flatten(),
         )
         self.linear = nn.Sequential(
-            nn.Linear(2688, features_dim),
+            nn.Linear({n_flatten_global}, features_dim),
             nn.ReLU(),
         )
     def forward(self, observations):
@@ -228,16 +245,18 @@ class ConnectFourExtractor(nn.Module):
 class ConnectFourPolicy(nn.Module):
     def __init__(self):
         super().__init__()
-        self.features_extractor = ConnectFourExtractor(features_dim=64)
+        self.features_extractor = ConnectFourExtractor(features_dim=256)
         self.pi_net = nn.Sequential(
-            nn.Linear(64, 64),
+            nn.Linear(256, 256),
             nn.ReLU(),
-            nn.Linear(64, 64),
+            nn.Linear(256, 128),
             nn.ReLU(),
-            nn.Linear(64, 64),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 42),
             nn.ReLU(),
         )
-        self.action_net = nn.Linear(64, 7)  # 輸出 7 個動作的 logits
+        self.action_net = nn.Linear(42, 7)  # 輸出 7 個動作的 logits
 
 
     def forward(self, obs):

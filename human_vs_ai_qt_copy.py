@@ -65,7 +65,7 @@ class AIThread(QThread):
             action = agent(obs, Config())  # 根據你的模型調整參數
             
             # 驗證動作使用 action_mask
-            action_mask = obs['action_mask']
+            action_mask = np.where(obs['board'].reshape(self.rows, self.cols)[0,:] == 0, 1, 0)
             if action_mask[action] == 0:
                 # 如果無效，選擇第一個有效動作
                 valid_actions = np.where(action_mask == 1)[0]
@@ -79,7 +79,7 @@ class AIThread(QThread):
         except Exception as e:
             print(f"AI決策出錯: {e}")
             # 回退到第一個有效動作
-            action_mask = obs.get('action_mask', np.ones(7))  # 預設全有效
+            action_mask = np.where(obs['board'].reshape(self.rows, self.cols)[0,:] == 0, 1, 0)
             valid_actions = np.where(action_mask == 1)[0]
             if len(valid_actions) > 0:
                 action = int(valid_actions[0])
