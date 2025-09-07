@@ -9,7 +9,6 @@ from stable_baselines3.common.policies import ActorCriticPolicy  # 如果需要
 from gymnasium import spaces
 from sb3_contrib import MaskablePPO
 
-
 # 定義 standalone PyTorch 模型（基於你提供的 ConnectFourExtractor 和 policy 結構）
 class ResBlock(nn.Module):
     def __init__(self, channels):
@@ -53,10 +52,10 @@ class ConnectFourExtractor(nn.Module):
             sample_obs = {
                 "board": np.zeros((self.height * self.width,), dtype=np.float32),
                 "mark": [0],
+                "action_mask": np.ones((self.width,), dtype=np.float32),
             }
             sample_tensor = self._prepare_sample(sample_obs)
             n_flatten = self.cnn(sample_tensor).shape[1]
-            print(f'n_flatten: {n_flatten}')
         self.linear = nn.Sequential(
             nn.Linear(n_flatten, features_dim),
             nn.ReLU(),
@@ -71,7 +70,7 @@ class ConnectFourExtractor(nn.Module):
         opponent_plane = (board == opponent_mark).float()
         turn_plane = (mark - 1.0).expand_as(board)
         
-        stacked = torch.stack([player_plane, opponent_plane, turn_plane], dim=0)  # (3, 6, 7)
+        stacked = torch.stack([player_plane, opponent_plane, turn_plane], dim=0)  # (5, 6, 7)
         return stacked.unsqueeze(0)  # (1, 5, 6, 7)
     def forward(self, observations):
         board = observations['board'].reshape(-1, self.height, self.width)
@@ -126,6 +125,8 @@ class ConnectFourPolicy(nn.Module):
         features = self.features_extractor(obs)
         latent_pi = self.pi_net(features)
         logits = self.action_net(latent_pi)
+        action_mask = obs["action_mask"]
+        logits = logits + (1 - action_mask) * -1e8  # Mask 無效動作
         return logits
 
 
@@ -243,6 +244,8 @@ class ConnectFourPolicy(nn.Module):
         features = self.features_extractor(obs)
         latent_pi = self.pi_net(features)
         logits = self.action_net(latent_pi)
+        action_mask = obs["action_mask"]
+        logits = logits + (1 - action_mask) * -1e8  # Mask 無效動作
         return logits
 
 # 嵌入的 base64 權重（從步驟 2 複製過來）
@@ -290,8 +293,23 @@ def agent(observation, configuration):
     mark = np.array([observation['mark']], dtype=np.float32).reshape(1, 1)  # (1,1)
     mark_scalar = int(mark[0, 0])
 
+    # 先做簡單的 immediate win 檢查（使用 scalar）
+    for c in range(7):
+        if board[0, c] == 0:
+            row = _next_open_row(board, c)
+            board[row, c] = mark_scalar
+            if _is_winner(board, mark_scalar):
+                return int(c)
+            board[row, c] = 0
 
 
+    for c in range(7):
+        if board[0, c] == 0:
+            row = _next_open_row(board, c)
+            board[row, c] = 3 - mark_scalar
+            if _is_winner(board, 3 - mark_scalar):
+                return int(c)
+            board[row, c] = 0
 
     # action mask
     action_mask = np.zeros(7, dtype=np.float32)
@@ -305,6 +323,7 @@ def agent(observation, configuration):
     obs = {{
         "board": torch.from_numpy(board.flatten().astype(np.float32)).unsqueeze(0),        # (1,42)
         "mark": torch.from_numpy(mark.astype(np.float32)),                                # (1,1)
+        "action_mask": torch.from_numpy(action_mask.astype(np.float32)).unsqueeze(0),     # (1,7)
     }}
 
     with torch.no_grad():

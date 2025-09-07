@@ -13,6 +13,7 @@ submission.py
 checkopponents/
 submission**
 checkpoints/
+scatter/
 *.pkl
 *.pth
 *.build/
