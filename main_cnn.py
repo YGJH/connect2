@@ -25,6 +25,8 @@ import sys
 import matplotlib.pyplot as plt
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.maskable.policies import MaskableActorCriticPolicy
+import wandb
+from wandb.integration.sb3 import WandbCallback
 
 
 def make_env(rank, seed=0, render_mode=None, folder_path='checkopponents'):
@@ -170,12 +172,21 @@ class ValueScatterCallback(BaseCallback):
 
             save_file = os.path.join(self.save_path, f"value_scatter_{self.num_timesteps}.png")
             plt.savefig(save_file)
+            
+            # Log to wandb
+            if wandb.run is not None:
+                wandb.log({
+                    "value_scatter": wandb.Image(save_file),
+                    "value_returns_correlation": corr,
+                    "num_samples": len(values)
+                }, step=self.num_timesteps)
+            
             plt.close()
 
             if self.verbose > 0:
                 print(f"[ValueScatterCallback] Saved scatter plot to {save_file}, corr={corr:.3f}")
+    
     def _on_step(self) -> bool:
-        # 必須要有，不然不能被實例化
         return True
 
 
@@ -250,6 +261,14 @@ class EvaluationCallback(BaseCallback):
                 if 'win_rate' in info:
                     self.win_rates.append(info['win_rate'])
 
+                # Log individual episode metrics to wandb
+                if wandb.run is not None:
+                    wandb.log({
+                        "episode_reward": ep_r,
+                        "episode_length": info.get('episode_length', 0),
+                        "game_result": 1 if game_result == 'win' else (0.5 if game_result == 'draw' else 0)
+                    }, step=self.num_timesteps)
+
         if self.num_timesteps - self.last_eval_step >= self.eval_freq:
             self._evaluate_and_log()
             self.last_eval_step = self.num_timesteps
@@ -259,7 +278,6 @@ class EvaluationCallback(BaseCallback):
     def _evaluate_and_log(self):
         if len(self.rewards) < 100:
             return
-
 
         self.eval_count += 1
         recent_rewards = self.rewards[-1000:]
@@ -278,8 +296,36 @@ class EvaluationCallback(BaseCallback):
         avg_episode_length = np.mean(self.episode_lengths[-100:]) if self.episode_lengths else 0
         avg_episode_reward = np.mean(self.episode_rewards[-100:]) if self.episode_rewards else 0
 
+        # Update entropy coefficient
+        current_ent_coef = self.coef_fun(self.num_timesteps)
+        self.model.ent_coef = current_ent_coef
 
-        
+        # Log comprehensive metrics to wandb
+        if wandb.run is not None:
+            wandb_metrics = {
+                "eval/mean_reward_1000": mean_reward,
+                "eval/std_reward_1000": std_reward,
+                "eval/best_mean_reward": self.best_mean_reward,
+                "eval/avg_episode_reward_100": avg_episode_reward,
+                "eval/total_games": total_games,
+                "eval/win_rate": win_rate,
+                "eval/draw_rate": draw_rate,
+                "eval/loss_rate": loss_rate,
+                "eval/avg_episode_length_100": avg_episode_length,
+                "eval/episode_count": self.episode_count,
+                "training/entropy_coefficient": current_ent_coef,
+                "training/learning_rate": self.model.learning_rate,
+            }
+            
+            # Log opponent statistics
+            for opponent, stats in self.opponent_stats.items():
+                if stats['games'] > 0:
+                    opp_wr = stats['wins'] / stats['games']
+                    wandb_metrics[f"opponents/{opponent}_win_rate"] = opp_wr
+                    wandb_metrics[f"opponents/{opponent}_games"] = stats['games']
+            
+            wandb.log(wandb_metrics, step=self.num_timesteps)
+
         log_info = f"""
 === 訓練統計 (Step: {self.num_timesteps}) ===
 📊 Reward:
@@ -295,8 +341,10 @@ class EvaluationCallback(BaseCallback):
 ⏱ 進度:
   - 總共執行的遊戲: {self.episode_count}
   - 平均長度 (last 100): {avg_episode_length:.1f}
+
+🔧 訓練參數:
+  - 當前熵係數: {current_ent_coef:.6f}
 """
-        self.model.ent_coef = self.coef_fun(self.num_timesteps)
 
         for opponent, stats in self.opponent_stats.items():
             if stats['games'] > 0:
@@ -307,10 +355,16 @@ class EvaluationCallback(BaseCallback):
         import os
         model_name = f"ppo_connectfour_best_cnn_{mean_reward:.3f}.zip"
         self.model.save(os.path.join('checkpoints', model_name))
+        
         if mean_reward > self.best_mean_reward:
             send_telegram(f"新最佳模型\nMean(step1000)={mean_reward:.3f} WinRate={win_rate:.3f}")
             self.best_mean_reward = mean_reward
-        
+            
+            # Log model artifact to wandb
+            if wandb.run is not None:
+                artifact = wandb.Artifact(f"best_model_{self.num_timesteps}", type="model")
+                artifact.add_file(os.path.join('checkpoints', model_name))
+                wandb.log_artifact(artifact)
         
         
         if self.eval_count > 49 and self.visualize_model is not None:
@@ -377,6 +431,19 @@ class EvaluationCallback(BaseCallback):
         self.model.save(os.path.join('checkpoints', final_name))
         total_games = sum(self.game_results.values())
         win_rate = self.game_results['win'] / total_games if total_games else 0
+        
+        # Log final model artifact to wandb
+        if wandb.run is not None:
+            artifact = wandb.Artifact("final_model", type="model")
+            artifact.add_file(os.path.join('checkpoints', final_name))
+            wandb.log_artifact(artifact)
+            
+            wandb.log({
+                "final/total_games": total_games,
+                "final/win_rate": win_rate,
+                "final/total_timesteps": self.num_timesteps
+            })
+        
         send_telegram(f"訓練結束 steps={self.num_timesteps} games={total_games} win_rate={win_rate:.3f}")
 
 
@@ -557,6 +624,12 @@ def main():
     parser.add_argument('--vf_coef', default=1.0, type=float, help='vf_coef')
     parser.add_argument('--batch_size', default=256, type=int, help='batch_size')
     parser.add_argument('--end_coef', default=0.01, type=float, help='end_coef')
+    # 新增 wandb 相關參數
+    parser.add_argument('--wandb_project', default='connect4-training', type=str, help='wandb project name')
+    parser.add_argument('--wandb_entity', default=None, type=str, help='wandb entity/team name')
+    parser.add_argument('--wandb_name', default=None, type=str, help='wandb run name')
+    parser.add_argument('--no_wandb', action='store_true', help='disable wandb logging')
+    
     args, _ = parser.parse_known_args()
     model_path = args.model
     num_cpu = int(args.num_cpu)
@@ -568,6 +641,38 @@ def main():
     vf_coef = float(args.vf_coef)
     total_step = int(args.total_step)
     end_coef = float(args.end_coef)
+
+    # Initialize wandb
+    if not args.no_wandb:
+        wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=args.wandb_name,
+            config={
+                "algorithm": "MaskablePPO",
+                "environment": "ConnectFour",
+                "total_timesteps": total_step,
+                "num_cpu": num_cpu,
+                "learning_rate": learning_rate,
+                "n_steps": n_steps,
+                "batch_size": batch_size,
+                "n_epochs": n_epochs,
+                "ent_coef": ent_coef,
+                "vf_coef": vf_coef,
+                "end_coef": end_coef,
+                "eval_freq": args.eval_freq,
+                "model_path": model_path,
+                "architecture": "CNN with ResBlocks",
+                "features_dim": 64,
+                "n_channels": 64,
+                "gamma": 0.99,
+                "gae_lambda": 0.95,
+                "clip_range": 0.2,
+                "max_grad_norm": 0.5,
+                "target_kl": 0.04
+            },
+            tags=["connect4", "self-play", "cnn", "ppo"]
+        )
 
     print(f"Model path: {model_path}")
     print(f'total_step: {total_step}')
@@ -630,7 +735,6 @@ def main():
     model.save('temp.zip')
     start_time = time.time()
 
-
     callback = EvaluationCallback(
         verbose=1,
         eval_freq=args.eval_freq,
@@ -650,16 +754,35 @@ def main():
     print(f"Memory usage before training: {mem_usage:.2f} MB")
 
     scatter_callback = ValueScatterCallback(check_freq=5, save_path="scatter", verbose=1)
-
+    
+    # Create wandb callback
+    callbacks = [callback, scatter_callback]
+    if not args.no_wandb:
+        wandb_callback = WandbCallback(
+            gradient_save_freq=1000,
+            model_save_path=f"models/{wandb.run.id}",
+            verbose=2,
+        )
+        callbacks.append(wandb_callback)
 
     model.learn(
         total_timesteps=total_step,
-        callback=[callback, scatter_callback],
+        callback=callbacks,
         progress_bar=True,
         tb_log_name="ppo_cartpole_r1"
     )
+    
     print(f"Memory usage after training: {mem_usage:.2f} MB")
     print(f"Training completed! Time taken: {time.time() - start_time:.2f} seconds")
+    
+    # Log training completion
+    if not args.no_wandb:
+        wandb.log({
+            "training/total_time_seconds": time.time() - start_time,
+            "training/memory_usage_mb": mem_usage
+        })
+        wandb.finish()
+    
     env.close()
 
     print("Starting visualization test...")
