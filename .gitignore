@@ -11,6 +11,7 @@ opponents/
 videos/
 submission.py
 checkopponents/
+*.spec
 submission**
 checkpoints/
 scatter/
