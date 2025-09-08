@@ -330,11 +330,10 @@ def agent(observation, configuration):
         logits = model(obs)
         action = torch.argmax(logits, dim=1).item()
 
-    # fallback
     if action_mask[action] == 0:
-        valid_actions = np.where(action_mask == 1)[0]
-        action = int(np.random.choice(valid_actions)) if len(valid_actions) > 0 else 0
-
+        print('omg error in dump_weight_cnn')
+        action = np.random.choice(range(7) , p=action_mask)
+        
     return int(action)
 '''
 

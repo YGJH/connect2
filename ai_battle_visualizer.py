@@ -578,7 +578,7 @@ def main():
     
     # 設置AI文件路徑
     agent1_file = "submission.py"      # 第一個AI檔案（標籤用）
-    agent2_file = "opponents/submission_v47.py"       # 第二個AI檔案（標籤用）
+    agent2_file = "submission_vMega.py"       # 第二個AI檔案（標籤用）
     
     # 檢查文件是否存在
     if not os.path.exists(agent1_file):

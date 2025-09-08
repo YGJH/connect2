@@ -125,7 +125,7 @@ class CustomAlphaZeroPolicy(MaskableActorCriticPolicy):
             **kwargs,
             features_extractor_class=ConnectFourExtractor,
             features_extractor_kwargs=dict(features_dim=256),
-            net_arch=dict(pi=[256, 128, 64, 42], vf=[256, 128, 64, 42]),
+            net_arch=dict(pi=[256, 128, 64, 42], vf=[512]*4),
             activation_fn=nn.ReLU,
         )
 
@@ -134,7 +134,9 @@ class CustomAlphaZeroPolicy(MaskableActorCriticPolicy):
         features = super().extract_features(obs)
         latent_pi = self.mlp_extractor.forward_actor(features)
         logits = self.action_net(latent_pi)
-
+        board = obs['board'].reshape(6, 7)  # 假設obs['board']形狀為(42,)，如果是批次(batch)形狀如(batch_size, 42)，則改為reshape(-1, 6, 7)
+        action_mask = (board[0] == 0).float()  # 直接在PyTorch中計算浮點數遮罩（0.0 或 1.0），自動在相同裝置上
+        logits = logits + (action_mask.log() - 1e8 * (1 - action_mask))
         distribution = self.action_dist.proba_distribution(action_logits=logits)
         return distribution
 
@@ -368,7 +370,7 @@ class EvaluationCallback(BaseCallback):
                 wandb.log_artifact(artifact)
         
         
-        if self.eval_count > 29 and self.visualize_model is not None:
+        if self.eval_count > 0 and self.visualize_model is not None:
             must_saved_path = f'ppo_connectfour_best_cnn_{mean_reward:.3f}.py'
             cmd = [
                 # 'uv run dump_weight_cnn.py',
@@ -615,7 +617,7 @@ def main():
     print("\033[1;32m")
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', default=None, help='Path to the output file (optional).')
+    parser.add_argument('--model', default='checkpoints/ppo_connectfour_best_cnn_-0.037.zip', help='Path to the output file (optional).')
     parser.add_argument('--total_step', default=3000000, type=int, help='total_step to train')
     parser.add_argument('--num_cpu', default=2, type=int, help='cpu cores')
     parser.add_argument('--eval_freq', default=1001, type=int, help='eval_freq')
@@ -623,7 +625,7 @@ def main():
     parser.add_argument('--n_steps', default=2048, type=int, help='n_steps')
     parser.add_argument('--n_epochs', default=10, type=int, help='n_epochs')
     parser.add_argument('--ent_coef', default=0.03, type=float, help='ent_coef')
-    parser.add_argument('--vf_coef', default=0.8, type=float, help='vf_coef')
+    parser.add_argument('--vf_coef', default=0.3, type=float, help='vf_coef')
     parser.add_argument('--batch_size', default=256, type=int, help='batch_size')
     parser.add_argument('--end_coef', default=0.01, type=float, help='end_coef')
     # 新增 wandb 相關參數

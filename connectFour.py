@@ -132,8 +132,8 @@ class ConnectFourEnv(gym.Env):
         super().reset(seed=seed)
         self.board.fill(0)
         self.episode_count += 1
-        # prob_agent_second = 1.0 if self.always_lose_2 > 10 else 0.7  # 調整這個值來控制機率 (0.5 = 50%, 1.0 = 100%)
-        prob_agent_second = 1.0
+        prob_agent_second = 1.0 if self.always_lose_2 > 10 else 0.7  # 調整這個值來控制機率 (0.5 = 50%, 1.0 = 100%)
+        # prob_agent_second = 1.0
         
         if random.random() < prob_agent_second:
             # Agent 為後手
@@ -407,13 +407,14 @@ class ConnectFourEnv(gym.Env):
             reward += missed_defense_penalty
 
             # 攻擊獎勵：自己的連線
-            connection_reward = self._get_connection_reward(row, action_to_use, current_piece)
-            reward += connection_reward
+            # connection_reward = self._get_connection_reward(row, action_to_use, current_piece)
+            # reward += connection_reward
             
             # 防守獎勵：阻止對手連線
             # defense_reward = self._get_defense_reward(row, action_to_use, current_piece)
             # reward += defense_reward
-
+            if self.is_second == False and self.step_count == 1:
+                reward += (action - 3)  * 0.02  # 先手前鼓勵下中間
         self.current_player = 3 - self.current_player
         info.update({'evaluation': reward})
         return self._get_obs(), reward, False, False, info
