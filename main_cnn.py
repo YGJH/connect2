@@ -129,14 +129,14 @@ class CustomAlphaZeroPolicy(MaskableActorCriticPolicy):
             activation_fn=nn.ReLU,
         )
 
-    def get_distribution(self, obs):
+    def get_distribution(self, obs, actions=None):
         # 先拿 feature
         features = super().extract_features(obs)
         latent_pi = self.mlp_extractor.forward_actor(features)
         logits = self.action_net(latent_pi)
+
         distribution = self.action_dist.proba_distribution(action_logits=logits)
         return distribution
-
 
 
 class ValueScatterCallback(BaseCallback):
@@ -212,6 +212,8 @@ class EvaluationCallback(BaseCallback):
         self.eval_count = 0
         self.last_eval_step = 0
         self.visualize_model = visualize_model
+        self.need_update = False  # 新增：更新标志
+        self.must_saved_path = None  # 新增：保存路径
 
         os.makedirs(save_path, exist_ok=True)
 
@@ -224,13 +226,6 @@ class EvaluationCallback(BaseCallback):
         self.current_episode_rewards = [0.0] * n_envs
 
     def _on_step(self):
-
-        if self.n_calls % self.eval_freq == 0:
-            model_path = "selfplay_model.zip"
-            self.model.save(model_path)
-            if self.verbose > 0:
-                print(f"Updated self-play model path: {model_path}")
-
         infos = self.locals.get('infos', [])
         step_rewards = self.locals.get('rewards', [])
         dones = self.locals.get('dones', [])
@@ -373,15 +368,15 @@ class EvaluationCallback(BaseCallback):
                 wandb.log_artifact(artifact)
         
         
-        if self.eval_count > 20 and self.visualize_model is not None:
-            most_saved_path = f'ppo_connectfour_best_cnn_{mean_reward:.3f}.py'
+        if self.eval_count > 29 and self.visualize_model is not None:
+            must_saved_path = f'ppo_connectfour_best_cnn_{mean_reward:.3f}.py'
             cmd = [
                 # 'uv run dump_weight_cnn.py',
                 './dist/dump_weight_cnn/dump_weight_cnn',
                 '--model_path',
                 os.path.join('checkpoints', model_name),
                 '--output',
-                os.path.join('checkopponents', most_saved_path),
+                os.path.join('checkopponents', must_saved_path),
             ]
             cmd_strong = [
                 # 'uv run dump_weight_cnn.py',
@@ -389,7 +384,7 @@ class EvaluationCallback(BaseCallback):
                 '--model_path',
                 os.path.join('checkpoints', model_name),
                 '--output',
-                os.path.join('checkopponents', most_saved_path),
+                os.path.join('checkopponents', must_saved_path),
             ]
 
 
@@ -408,6 +403,13 @@ class EvaluationCallback(BaseCallback):
                         os.remove(os.path.join('checkopponents', f))
 
             self.opponent_stats.clear()
+
+
+
+            self.visualize_model(self.model, num_episodes=1)
+            self.eval_count = 0
+
+
             try:
                 import numpy as np
                 import subprocess
@@ -417,13 +419,11 @@ class EvaluationCallback(BaseCallback):
                 else:
                     subprocess.run(cmd , shell=True, capture_output=True)
                 # update opponent_list
-                self.training_env.env_method('update_opponents', most_saved=most_saved_path)
+                self.training_env.env_method('update_opponents', must_saved=must_saved_path)
             except Exception as e:
                 print(f"Error occurred while dumping weights: {e}")
                 raise Exception("Weight dumping failed")
 
-            self.visualize_model(self.model, num_episodes=1)
-            self.eval_count = 0
 
 
     def _on_training_end(self):
@@ -483,10 +483,11 @@ def visualize_model(model, num_episodes=5):
 
                 action, _ = model.predict(obs, deterministic=True)  # Pass the full dict obs here
                 action = int(action.item())
-                valid_actions = np.where(obs['board'].reshape(6, 7)[0,:] == 0, 1, 0)[0]
+                valid_actions = np.where(obs['board'].reshape(6, 7)[0,:] == 0, 1, 0)
                 if valid_actions[action] == 0:
                     if len(valid_actions) > 0:
                         print(f"\033[31m[visualize_model]agent Invalid action {action} predicted, using random valid action={action}\033[0m")
+                        break
                     else:
                         print("\033[31m[visualize_model] opponent No valid actions, terminating\033[0m")
                         terminated = True
@@ -616,12 +617,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', default=None, help='Path to the output file (optional).')
     parser.add_argument('--total_step', default=3000000, type=int, help='total_step to train')
-    parser.add_argument('--num_cpu', default=5, type=int, help='cpu cores')
+    parser.add_argument('--num_cpu', default=2, type=int, help='cpu cores')
     parser.add_argument('--eval_freq', default=1001, type=int, help='eval_freq')
     parser.add_argument('--lr', default=1e-4, type=float, help='learning rate')
     parser.add_argument('--n_steps', default=2048, type=int, help='n_steps')
-    parser.add_argument('--n_epochs', default=20, type=int, help='n_epochs')
-    parser.add_argument('--ent_coef', default=0.08, type=float, help='ent_coef')
+    parser.add_argument('--n_epochs', default=10, type=int, help='n_epochs')
+    parser.add_argument('--ent_coef', default=0.03, type=float, help='ent_coef')
     parser.add_argument('--vf_coef', default=0.8, type=float, help='vf_coef')
     parser.add_argument('--batch_size', default=256, type=int, help='batch_size')
     parser.add_argument('--end_coef', default=0.01, type=float, help='end_coef')
@@ -797,7 +798,7 @@ if __name__ == '__main__':
         pass
     try:
         # Force fork start method to avoid forkserver/spawn introducing extra CLI flags
-        mp.set_start_method('fork', force=True)
+        mp.set_start_method('spawn', force=True)
     except RuntimeError:
         # start method already set; ignore
         pass

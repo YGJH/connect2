@@ -69,6 +69,9 @@ class ConnectFourEnv(gym.Env):
         self.render_mode = render_mode
         self.action_space = spaces.Discrete(self.width)
         self.config = ConnectFourEnv.Config()
+    
+        self.update_opponents()
+    
     def _get_obs(self):
 
         mark = np.array([self.agent_piece], dtype=np.float32)
@@ -208,7 +211,7 @@ class ConnectFourEnv(gym.Env):
             action = np.random.choice(valid_actions) if len(valid_actions) > 0 else 0
         return action           
 
-        
+
     def _update_info(self, info):
         opponent_name = self._opponent_name_cached
         if opponent_name not in self.opponent_stats:
@@ -296,7 +299,7 @@ class ConnectFourEnv(gym.Env):
         
         # 如果有獲勝機會但沒有選擇，給予懲罰
         if len(winning_actions) > 0:
-            penalty = -0.9  # 錯失勝機的懲罰
+            penalty = -0.35  # 錯失勝機的懲罰
             # print(f"[MISSED WIN] Agent could win with actions {winning_actions} but chose {action_taken}")
         
         return penalty
@@ -325,7 +328,7 @@ class ConnectFourEnv(gym.Env):
         
         # 如果對手有獲勝機會，但 agent 沒有選擇阻擋其中任何一個
         if len(critical_defense_actions) > 0 and action_taken not in critical_defense_actions:
-            penalty = -0.8  # 錯失防守的懲罰（比錯失勝機稍輕）
+            penalty = -0.3  # 錯失防守的懲罰（比錯失勝機稍輕）
             # print(f"[MISSED DEFENSE] Opponent can win with actions {critical_defense_actions} but agent chose {action_taken}")
         
         return penalty
@@ -404,8 +407,8 @@ class ConnectFourEnv(gym.Env):
             reward += missed_defense_penalty
 
             # 攻擊獎勵：自己的連線
-            # connection_reward = self._get_connection_reward(row, action_to_use, current_piece)
-            # reward += connection_reward
+            connection_reward = self._get_connection_reward(row, action_to_use, current_piece)
+            reward += connection_reward
             
             # 防守獎勵：阻止對手連線
             # defense_reward = self._get_defense_reward(row, action_to_use, current_piece)
@@ -415,48 +418,51 @@ class ConnectFourEnv(gym.Env):
         info.update({'evaluation': reward})
         return self._get_obs(), reward, False, False, info
 
-    def update_opponents(self, most_saved):
+    def update_opponents(self, must_saved=None):
         # 強制清理舊的 opponent_list 和相關引用
+        try:
+            import time
+            old_opponents = self.opponent_list.copy()  # 複製一份以便清理
+            self.opponent_list.clear()  # 清空 set
+            self.opponent_names.clear()
+            self.opponent_stats.clear()
+            
+            # 刪除舊 agent 的強引用（如果有）
+            for opp in old_opponents:
+                if hasattr(opp, '_source_file'):
+                    del opp  # 嘗試刪除引用
+            del old_opponents
 
-        old_opponents = self.opponent_list.copy()  # 複製一份以便清理
-        self.opponent_list.clear()  # 清空 set
-        self.opponent_names.clear()
-        self.opponent_stats.clear()
+            # 使用字典追蹤已載入的 agent，避免重複
+            loaded_agents = {}  # key: file_path, value: weakref to agent
+            selected_files = [f for f in os.listdir(self.folder_path) if f.endswith('.py')]
         
-        # 刪除舊 agent 的強引用（如果有）
-        for opp in old_opponents:
-            if hasattr(opp, '_source_file'):
-                del opp  # 嘗試刪除引用
-        del old_opponents
+            
+            # 限制載入數量（e.g., 最多 5 個外部 agent）
+            # selected_files = random.sample(files, self.max_opponents)  # 簡單取前 5 個，或用 random.sample 如果需要隨機
+            if must_saved != None:
+                selected_files.append(must_saved)
 
-        # 使用字典追蹤已載入的 agent，避免重複
-        loaded_agents = {}  # key: file_path, value: weakref to agent
-        selected_files = [f for f in os.listdir(self.folder_path) if f.endswith('.py')]
-    
-        
-        # 限制載入數量（e.g., 最多 5 個外部 agent）
-        # selected_files = random.sample(files, self.max_opponents)  # 簡單取前 5 個，或用 random.sample 如果需要隨機
-        selected_files.append(most_saved)
+            for f in selected_files:
+                if f in loaded_agents:
+                    # 如果已載入，直接使用弱引用
+                    agent_ref = loaded_agents[f]
+                    agent = agent_ref() if agent_ref() is not None else None
+                else:
+                    agent = self.load_agent(f)
+                    if agent:
+                        loaded_agents[f] = weakref.ref(agent)  # 弱引用，避免強引用
 
-        for f in selected_files:
-            if f in loaded_agents:
-                # 如果已載入，直接使用弱引用
-                agent_ref = loaded_agents[f]
-                agent = agent_ref() if agent_ref() is not None else None
-            else:
-                agent = self.load_agent(f)
                 if agent:
-                    loaded_agents[f] = weakref.ref(agent)  # 弱引用，避免強引用
-
-            if agent:
-                self.opponent_list.append(agent)
-                name = getattr(agent, '_source_file', f'unknown_{f}')
-                self.opponent_names.append(name)
-                self.opponent_stats[name] = {'games': 0, 'agent_wins': 0, 'opponent_wins': 0, 'draws': 0}
+                    self.opponent_list.append(agent)
+                    name = getattr(agent, '_source_file', f'unknown_{f}')
+                    self.opponent_names.append(name)
+                    self.opponent_stats[name] = {'games': 0, 'agent_wins': 0, 'opponent_wins': 0, 'draws': 0}
 
 
-        gc.collect()  # 再次清理
-
+            gc.collect()  # 再次清理
+        except Exception as e:
+            print(f"\033[31m[update_opponents] Error updating opponents: {e}\033[0m")
 
 
     def _is_valid_action(self, action):

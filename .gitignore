@@ -17,7 +17,7 @@ checkpoints/
 scatter/
 wandb/
 models/
-
+submission**
 *.pkl
 *.pth
 *.build/
